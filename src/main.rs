@@ -772,8 +772,8 @@ html,body{margin:0;padding:0;min-height:100%;background:#141414;color:#eee;font:
 .winbtn:hover{background:#3a3a3a}
 #cls:hover{background:#c42b1c;color:#fff}
 #card{max-width:560px;margin:8vh auto 40px;background:#1e1e1e;border:1px solid #3a3a3a;border-radius:12px;padding:26px 30px;box-sizing:border-box}
-h1{font-size:18px;margin:0 0 6px}
-#state{color:#9a9a9a;font-size:12px;margin-bottom:18px}
+h1{font-size:18px;margin:0 0 6px;text-align:center}
+#state{color:#9a9a9a;font-size:12px;margin-bottom:18px;text-align:center}
 .opt{display:block;width:100%;text-align:left;background:#2d2d2d;color:#eee;border:1px solid #4a4a4a;border-radius:8px;padding:12px 14px;font-size:13px;cursor:pointer;margin-bottom:10px;font-family:inherit}
 .opt:hover{background:#3a3a3a}
 .opt small{display:block;color:#9a9a9a;font-size:11px;margin-top:3px}
@@ -783,18 +783,25 @@ h1{font-size:18px;margin:0 0 6px}
 button{background:#2d2d2d;color:#eee;border:1px solid #4a4a4a;border-radius:6px;padding:6px 14px;font-size:12px;cursor:pointer;font-family:inherit}
 button:hover{background:#3a3a3a}
 button:disabled{opacity:.5;cursor:default}
-#phase{color:#9a9a9a;font-size:12px;margin:14px 0 6px;min-height:16px}
-#log{background:#0d0d0d;border:1px solid #2e2e2e;border-radius:8px;padding:10px 12px;font:11px Consolas,monospace;white-space:pre-wrap;max-height:220px;overflow-y:auto;min-height:60px;color:#bbb}
-#cancel{display:block;margin:16px auto 0;background:none;border:none;color:#777;font-size:12px;cursor:pointer}
-#cancel:hover{color:#ccc}
+#phase{color:#9a9a9a;font-size:12px;margin:0 0 6px;min-height:16px}
+#details{display:none;margin-top:14px}
+#toggle{background:none;border:none;color:#9a9a9a;font-size:12px;cursor:pointer;display:flex;align-items:center;gap:6px;padding:4px 0;font-family:inherit}
+#toggle:hover{color:#ccc}
+#toggle svg{transition:transform .15s}
+#toggle.open svg{transform:rotate(180deg)}
+#log{display:none;background:#0d0d0d;border:1px solid #2e2e2e;border-radius:8px;padding:10px 12px;font:11px Consolas,monospace;white-space:pre-wrap;max-height:220px;overflow-y:auto;color:#bbb;margin-top:6px}
+#foot{display:flex;justify-content:flex-end;margin-top:18px}
+#cancel{background:none;border:1px solid #4a4a4a;color:#ccc;border-radius:6px;padding:6px 16px;font-size:12px;cursor:pointer;font-family:inherit}
+#cancel:hover{background:#2d2d2d;color:#fff}
+#cancel:disabled{opacity:.4;cursor:default}
 </style></head><body>
 <div id=head><span id=brand>dsh-desktop setup</span><span id=wins><button class=winbtn id=min>─</button><button class=winbtn id=max>▢</button><button class=winbtn id=cls>✕</button></span></div>
 <div id=card><h1>Choose your dsh backend</h1><div id=state></div>
 <button class=opt id=b-bundled>Install bundled dsh (recommended)<small>Clones upstream, installs, builds. Updates arrive via Settings → Upgrade dsh.</small></button>
 <button class=opt id=b-custom>Use my own dsh<small>You update it yourself with plain git. The shell never touches it.</small></button>
 <div id=cpath><input id=pin readonly placeholder="No folder chosen yet"><div class=row><button id=browse>Browse…</button><button id=use>Use this folder</button></div></div>
-<div id=phase></div><div id=log></div>
-<button id=cancel>Cancel</button>
+<div id=details><div id=phase></div><button id=toggle>Show details<svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 3.5 5 6.5 8 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button><div id=log></div></div>
+<div id=foot><button id=cancel>Cancel</button></div>
 </div><script>
 (function(){
 var base='__BASE__';
@@ -808,21 +815,25 @@ head.addEventListener('mousemove',function(e){if(!dp)return;if(Math.abs(e.client
 head.addEventListener('mouseup',function(){dp=null});
 var phase=document.getElementById('phase'),log=document.getElementById('log'),state=document.getElementById('state');
 var cpath=document.getElementById('cpath'),pin=document.getElementById('pin');
+var details=document.getElementById('details'),toggle=document.getElementById('toggle'),cancelBtn=document.getElementById('cancel');
 var busy=false;
+function revealDetails(){details.style.display='block'}
+function setBusy(b){busy=b;cancelBtn.disabled=b}
+toggle.onclick=function(){var open=log.style.display==='block';log.style.display=open?'none':'block';toggle.classList.toggle('open',!open);toggle.childNodes[0].textContent=!open?'Hide details':'Show details'};
 document.getElementById('b-bundled').onclick=function(){
-if(busy)return;busy=true;phase.textContent='Starting…';
-post('/setup-start',{kind:'bundled'}).then(function(r){if(r.error){busy=false;phase.textContent='Failed: '+r.error}}).catch(function(){busy=false;phase.textContent='Shell unreachable'})};
+if(busy)return;setBusy(true);revealDetails();phase.textContent='Starting…';
+post('/setup-start',{kind:'bundled'}).then(function(r){if(r.error){setBusy(false);phase.textContent='Failed: '+r.error}}).catch(function(){setBusy(false);phase.textContent='Shell unreachable'})};
 document.getElementById('b-custom').onclick=function(){cpath.style.display='block'};
 document.getElementById('browse').onclick=function(){post('/setup-pick',{}).then(function(r){if(r.path)pin.value=r.path})};
 document.getElementById('use').onclick=function(){
-if(busy||!pin.value)return;busy=true;phase.textContent='Validating…';
-post('/setup-start',{kind:'custom',path:pin.value}).then(function(r){if(r.error){busy=false;phase.textContent='Not usable: '+r.error}else{phase.textContent='Accepted — relaunching…'}}).catch(function(){busy=false;phase.textContent='Shell unreachable'})};
-document.getElementById('cancel').onclick=function(){post('/setup-cancel',{})};
+if(busy||!pin.value)return;setBusy(true);revealDetails();phase.textContent='Validating…';
+post('/setup-start',{kind:'custom',path:pin.value}).then(function(r){if(r.error){setBusy(false);phase.textContent='Not usable: '+r.error}else{phase.textContent='Accepted — relaunching…'}}).catch(function(){setBusy(false);phase.textContent='Shell unreachable'})};
+document.getElementById('cancel').onclick=function(){if(busy)return;post('/setup-cancel',{})};
 setInterval(function(){fetch(base+'/setup-status').then(function(r){return r.json()}).then(function(s){
-state.textContent=s.state||'';if(s.phase)phase.textContent=s.phase;
+state.textContent=s.state||'';if(s.phase){revealDetails();phase.textContent=s.phase}
 if(s.log)log.textContent=s.log.join('\n');
 if(s.done&&!s.error)phase.textContent=s.phase+' — relaunching…';
-if(s.done&&s.error){busy=false;phase.textContent='Failed: '+s.error}}).catch(function(){})},1000);
+if(s.done&&s.error){setBusy(false);phase.textContent='Failed: '+s.error}}).catch(function(){})},1000);
 })();
 </script></body></html>"#;
     PAGE.replace("__BASE__", &format!("http://{CONTROL_ADDR}"))
