@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Form probe</title></head>
+<body>
+<main>
+<h1>Form probe</h1>
+<form id="f" action="#done" method="get">
+<label for="q">Query</label>
+<input id="q" name="q" type="text" autocomplete="off">
+<button id="go" type="submit">Search</button>
+</form>
+<div id="out">not submitted</div>
+</main>
+<script>
+document.getElementById('f').addEventListener('submit', (e) => {
+  e.preventDefault();
+  document.getElementById('out').textContent = 'submitted:' + document.getElementById('q').value;
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,67 @@
+@echo off
+rem dsh backend updater: the shell spawns this detached (new console, outlives
+rem the shell), then exits. Args: %1=backend dir %2=remote name %3=branch %4=shell exe.
+rem Result lands in update-status.json for the next boot to toast; every
+rem failure relaunches the old code, so a bad update can never brick the shell.
+setlocal
+set "SRC=%~1"
+set "REMOTE=%~2"
+set "BRANCH=%~3"
+set "SHELL=%~4"
+set "HOME_DSH=%LOCALAPPDATA%\dsh-desktop"
+set "STATUS=%HOME_DSH%\update-status.json"
+set "LOG=%HOME_DSH%\update.log"
+if not exist "%HOME_DSH%" mkdir "%HOME_DSH%"
+call :run > "%LOG%" 2>&1
+exit /b 0
+
+:run
+for /f %%h in ('git -C "%SRC%" rev-parse HEAD') do set "PRE=%%h"
+echo [updater] pre=%PRE% remote=%REMOTE% branch=%BRANCH%
+git -C "%SRC%" fetch "%REMOTE%" "%BRANCH%"
+if errorlevel 1 goto :fail_fetch
+git -C "%SRC%" merge --ff-only "%REMOTE%/%BRANCH%"
+if errorlevel 1 goto :fail_merge
+for /f %%h in ('git -C "%SRC%" rev-parse HEAD') do set "NEW=%%h"
+if "%NEW%"=="%PRE%" goto :unchanged
+cd /d "%SRC%"
+call pnpm install
+if errorlevel 1 goto :fail_install
+call pnpm run build
+if errorlevel 1 goto :fail_build
+if exist "%SRC%\dsh-manifest.json" powershell -NoProfile -Command "$m=Get-Content '%SRC%\dsh-manifest.json'|ConvertFrom-Json;$m.commit='%NEW%';$m|ConvertTo-Json|Set-Content '%SRC%\dsh-manifest.json'"
+echo {"ok":true,"sha":"%NEW%"}> "%STATUS%"
+echo [updater] updated %PRE% to %NEW%
+goto :relaunch
+
+:unchanged
+echo {"ok":true,"sha":"%PRE%","note":"already-current"}> "%STATUS%"
+echo [updater] already current at %PRE%
+goto :relaunch
+
+:fail_fetch
+echo {"ok":false,"stage":"fetch","detail":"could not reach the source repo"}> "%STATUS%"
+echo [updater] fetch failed
+goto :relaunch
+
+:fail_merge
+echo {"ok":false,"stage":"merge","detail":"merge refused, local copy left untouched"}> "%STATUS%"
+echo [updater] ff-only merge refused
+goto :relaunch
+
+:fail_install
+git -C "%SRC%" reset --hard "%PRE%"
+echo {"ok":false,"stage":"install","detail":"install failed, rolled back"}> "%STATUS%"
+echo [updater] install failed, reset to %PRE%
+goto :relaunch
+
+:fail_build
+git -C "%SRC%" reset --hard "%PRE%"
+echo {"ok":false,"stage":"build","detail":"build failed, rolled back"}> "%STATUS%"
+echo [updater] build failed, reset to %PRE%
+goto :relaunch
+
+:relaunch
+echo [updater] relaunching shell
+start "" "%SHELL%"
+exit /b 0
