@@ -866,7 +866,13 @@ fn spawn_dsh(frame_port: u16) -> Result<(Child, String, u16), String> {
         }
         None => return Err("no dsh backend found (first-run setup never completed)".to_string()),
     };
-    eprintln!("[browser] dsh backend: {label} ({source})");
+    eprintln!("[browser] dsh backend: {label} ({source}{})", if source == "packaged backend" {
+        packaged_manifest()
+            .map(|m| format!(" @ {}", short_sha(&m.commit)))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    });
     if source == "packaged backend" {
         if let Some(dir) = packaged_dir() {
             packaged_backend_ready(&dir, true)?;
@@ -2430,7 +2436,7 @@ fn main() {
                 } else {
                     let stage = value.get("stage").and_then(|v| v.as_str()).unwrap_or("update");
                     let detail = value.get("detail").and_then(|v| v.as_str()).unwrap_or("unknown reason");
-                    (("dsh update failed".to_string(), format!("{stage}: {detail}"), false))
+                    ("dsh update failed".to_string(), format!("{stage}: {detail}"), false)
                 };
                 for _ in 0..4 {
                     std::thread::sleep(std::time::Duration::from_secs(8));
