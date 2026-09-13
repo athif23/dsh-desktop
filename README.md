@@ -1,199 +1,128 @@
 # dsh-desktop
 
-Boring Tauri v2 shell for upstream DSH — currently carrying the
-**multi-WebView native-browser feel experiment** (see below).
+Native desktop shell for upstream DSH (Tauri v2, Windows): frameless
+window with a custom title bar, a real-browser surface over the Browser
+panel, and a self-updating packaged backend. No DSH fork, no DSH
+frontend source here — the shell hosts `dsh web` and extends it through
+the out-of-tree [`dsh-browser`](https://github.com/athif23/dsh-browser)
+plugin.
 
-Hard rules (from the project brief):
+## Install & first run
 
-- No copy of DSH frontend source here; no DSH fork; no session APIs in Rust.
-- The CDP browser implementation stays in `dsh-browser` (Node). No Rust rewrite
-  without a concrete reason; no second WebView for the browser pane.
-- The same `dsh-browser` plugin must work in plain `dsh web` and under this shell.
-- No Electron, no GPUI. Backend self-update (Upgrade dsh) shipped; shell
-  installer + first-run provisioning in scope (see `packaging/`).
+Download `dsh-desktop_*_x64-setup.exe` from
+[Releases](https://github.com/athif23/dsh-desktop/releases) and run it
+(per-user, no admin). First launch shows a choice card:
 
-## Run the experiment shell
+- **Install bundled dsh** (recommended) — clones upstream, installs,
+  builds. Later updates arrive via Settings → Upgrade dsh.
+- **Use my own dsh** — your checkout, your `git pull`, your builds. The
+  shell uses it, checks it can boot, and otherwise never touches it.
 
-```sh
-cd <this-repo>
-cargo build            # debug binary -> target/debug/dsh-desktop.exe
-$env:DSH_SRC = "<your dsh checkout>"
-$env:DSH_BIN = "<this-repo>/dsh.cmd"
-./target/debug/dsh-desktop
-```
+Settings → **Backend…** reopens the card anytime.
 
-`dsh.cmd` is a dev-only shim launching `dsh web` from the live checkout in
-`DSH_SRC` on a free loopback port. Normal use provisions the packaged
-backend instead (see `packaging/`). The shell prints the DSH URL,
-creates one native window with **two WebViews** (`dsh` = official UI filling
-the window, `browser` = real page, hidden), and serves the loopback control
-plane at `http://127.0.0.1:45331`.
+## How it works
 
-Backend resolution order (first hit wins, logged at boot as
-`dsh backend: <bin> (<source>)`): `DSH_BIN` env (dev against a live
-checkout) → settings custom dir (user's own checkout, launched as
-`node --import tsx/esm apps/cli/src/bin.ts` with cwd) → installer-packaged
-backend (`%LOCALAPPDATA%\dsh-desktop\dsh-src\dsh-packaged.cmd`) → sibling
-`dsh.cmd` next to the exe → `dsh` on PATH → nothing (first-run setup).
-
-## First-run setup
-
-With no usable backend (and no `DSH_BIN`) the shell boots shell-owned:
-the shellbar view goes full-window with a choice card (no DSH page
-exists yet). **Install bundled** provisions upstream (clone → manifest +
-launcher + updater → `pnpm install` → `pnpm run build`, all with polled
-progress and a heartbeat; a failed attempt wipes itself so retry heals;
-success relaunches into normal boot). **Use my own** takes a folder,
-validates installed + built, saves it to settings, and relaunches onto
-it. An unfinished packaged tree or a broken custom dir also lands here
-with the exact reason instead of a dead exit. Settings → **Backend…**
-reopens the card anytime (Cancel returns when a backend exists).
-
-## Packaged backend + Upgrade dsh
-
-The installer lays down a clone of **upstream**
-(`https://github.com/deepseek-ai/deepseek-harness.git`, `master`) plus
-three generated files (all in the clone's `.git/info/exclude`, so merges
-never touch them):
-
-- `dsh-manifest.json` — `{remote, branch, commit}` recorded at install.
-- `dsh-packaged.cmd` — `node --import tsx/esm apps/cli/src/bin.ts` in that dir.
-- `updater.cmd` — the detached updater (below).
-
-Backend rule: the packaged clone is pristine upstream, clone-only, never
-edited (`git status` there shows only the three generated files; the
-updater's ff-only merge refuses anything else). All behavior change ships
-as out-of-tree plugins (the `dsh-browser` template: own dir +
-`cordis.patch.yml`, loaded via profile into any backend). Fork only on
-purpose, temporarily, when something is impossible through extension
-points.
-
-The clone must be `pnpm install`ed **and built**: the per-user
-`$DSH_HOME/profiles/node_modules` fallback links at each boot to whichever
-checkout launched, and those links resolve workspace `lib/` output — a fresh
-clone with no `lib/` fails boot with `ERR_MODULE_NOT_FOUND` (measured).
-Same reason the updater runs `pnpm run build` after every merge. The shell
-pre-flights the packaged dir (`node_modules` + `apps/cli/lib/bin.js`) and
-refuses with the exact fix instead of spawning into that failure.
-
-Settings → **Upgrade dsh**: `POST /dsh-check` fetches the tracked branch
-(fetch only, safe while the child runs) and compares — up-to-date, behind
-(N commits), diverged, or dev-checkout-mode each get their own menu flash.
-Behind + native confirm → `POST /dsh-upgrade` spawns `updater.cmd`
-detached, kills the child, and exits. The updater fast-forward-merges,
-installs, builds (rolling back with `reset --hard` on install/build
-failure), relaunches the shell exe, and leaves `update-status.json`; the
-next boot toasts the verdict once and consumes the file. Refused outside
-the packaged backend — a dev checkout updates with plain git.
-
-Browser/backend skew: at boot the shell probes the running backend's
-`--version` and compares it against the staged dsh-browser copy's
-`package.json` `dsh.engines.backend` range (`>=0.1.5-rc.1` — the release
-that introduced the tab system). Match → `Backend: packaged · <v> ✓` in
-the Settings menu, silent. Mismatch → the same label names the gap plus
-one warning toast (`Browser tab unavailable… Chat is unaffected`), and
-the app runs on without the tab. Custom (non-packaged) backends are
-self-managed: labeled with their source, never judged, never touched —
-the updater refuses anything but the packaged dir.
-
-The shell pins its child's frame server (`DSH_BROWSER_FRAME_PORT`, default
-9453) and answers panel discovery at `GET /panel-config?dshPort=` with
-identity, so every Browser tab uses its own frame server and rect reports
-from foreign windows are ignored (never steer the overlay). Plain `dsh web`
-needs no shell restart for any of this work.
-
-WebView2 does not save downloads on its own, so both WebViews carry an
-`on_download` hook: session exports (`/api/session.export?sessionId=…`)
-land in `%USERPROFILE%\Downloads` as `dsh-session-<id>.zip` (the upstream
-filename convention); anything else keeps its URL last segment. Without
-this, the export modal reports success (its HEAD check passed) while no
-file ever arrives. Each finished download also pops a small bottom-right
-toast window naming the file and its folder (pure-JS Close button, ~9s
-auto-dismiss, no new dependencies — content renders from a temp HTML file,
-which is race-free on cold WebView2 start where a post-load eval showed an
-empty frame).
-
-## Experiment: native WebView2 over the Browser panel
-
-Goal: answer whether Tauri v2 can host the DSH UI in one WebView and a real
-browser in a second WebView positioned over the Browser side-panel region,
-with the agent controlling that exact WebView2 through CDP — and whether it
-feels like Codex/Zcode.
+One native window, three WebViews, explicit bounds everywhere (no
+auto-resize — one layout function owns every pixel, including under
+display scaling):
 
 ```text
 Tauri native window "main"
-├── WebView "dsh"      official `dsh web` (existing UI + Browser tab shell)
-└── WebView "browser"  real remote webpage (native scroll/select/type/video)
+├── "shellbar"  custom title bar (shell-owned page)
+├── "dsh"       official `dsh web` UI, untouched
+└── "browser"   real page, hidden until the Browser tab reports a rect
 ```
 
-- Second WebView: `WebviewBuilder::new("browser", …)` + `window.add_child(…)`
-  (needs the `unstable` feature), hidden until the Browser tab reports a rect.
-- Bounds sync: `dsh-browser`'s tab (`lib/client.js`, isolated `nativeRectBridge`
-  effect) POSTs `{visible,x,y,width,height,dpr}` of its canvas to
-  `POST /rect`. Rust applies `set_bounds` + `show`, or `hide` when the tab is
-  hidden/switched away. No hardcoded coordinates; ResizeObserver +
-  IntersectionObserver + window resize + 500ms tick + unmount `visible:false`.
-- Underlying WebView2: `webview.with_webview(|platform| …)` on Windows gives
-  `platform.controller().CoreWebView2()`; CDP goes through
-  `CallDevToolsProtocolMethod` (pattern copied from the `tinybot` prior art).
-  No remote-debugging port, no second browser process — one target by
-  construction.
-- Agent control = loopback HTTP (usable from any script, including the DSH
-  agent via shell): `POST /navigate {url}`, `POST /eval {js}`,
-  `POST /cdp {method, params}`, `GET /state`, `POST /show|/hide`,
-  `GET /health`, `GET /rect`. Scripted drive:
-  `pwsh -File experiment/test-drive.ps1`.
+The Browser tab (`dsh-browser` client) POSTs its canvas rect
+(`{visible,x,y,width,height,dpr}`) to the shell; Rust moves/shows the
+overlay under the panel toolbar, or hides it. Resize, reflow, and tab
+switches are all covered by observer + tick + unmount reports — no
+hardcoded coordinates, and stale rects are clamped so they can neither
+cover the toolbar nor spill past the window edge.
 
-### Machine-proven (2026-09-12, this box)
+The same WebView2 is agent-drivable through the loopback control plane
+(`http://127.0.0.1:45331`, same channel the bar and menus use):
+`POST /navigate {url}`, `POST /eval {js}`, `POST /cdp {method, params}`,
+`GET /state`, `POST /show|/hide`, `POST /reveal-tab`, window controls,
+restart/reload, settings, backend upgrade. CDP goes through
+`CallDevToolsProtocolMethod` on the platform WebView — no
+remote-debugging port, no second browser process.
 
-- `cargo check` + `cargo build` green (fixes needed: placeholder
-  `icons/icon.ico`, `frontendDist: "./dist-stub"`, shim must not duplicate
-  the `web` argv).
-- Window boots with both WebViews, no deadlock; DSH serves, control plane
-  answers.
-- Agent `navigate` → `example.com`, `github.com`; `eval document.title`
-  reads back correctly; raw CDP `Runtime.evaluate(location.href)` returns
-  the same page the (hidden-then-shown) WebView displays.
-- CDP `Page.captureScreenshot` renders sharp vector text
-  (`experiment/shot.jpg`); scripted DOM scroll/link queries work.
-- Finding: `Page.captureScreenshot` on a **hidden** WebView hangs past the
-  10s timeout; showing first fixes it (same compositor lesson as the
-  headless/occluded screencast work — budget a `tinybot`-style off-screen
-  `show` for background captures).
+Backend resolution order (first hit wins, logged at boot): `DSH_BIN`
+env (dev) → settings custom dir (launched as
+`node --import tsx/esm apps/cli/src/bin.ts` with cwd) → packaged
+backend (`%LOCALAPPDATA%\dsh-desktop\dsh-src`) → sibling `dsh.cmd` →
+`dsh` on PATH → first-run setup.
 
-### Needs human eyes/hands (mostly done 2026-09-12)
+## Packaged backend + Upgrade dsh
 
-- ✅ Native feel confirmed by user ("much better, much more responsive").
-- ✅ Picker: magenta hover outline + click returned a full ElementReference.
-- ✅ Resize: user dragged 667→391px; overlay, screenshot (489x1015 =
-  391×1.25 × 812×1.25 exact), and clicks tracked. Narrow-width caveat:
-  GitHub collapses nav into "More", hiding ref targets (see dsh-browser
-  README).
-- ⏳ Open (judgment calls): YouTube video playback smoothness, long
-  text-selection feel. Page loads + state sync verified by machine.
+The provisioned backend is a clone of **upstream**
+(`https://github.com/deepseek-ai/deepseek-harness.git`, `master`) plus
+three generated files (all in the clone's `.git/info/exclude`, so merges
+never touch them): `dsh-manifest.json` (`{remote, branch, commit}`),
+the launcher, and the detached `updater.cmd`.
 
-## Decision (2026-09-12)
+Backend rule: the packaged clone is pristine upstream, clone-only, never
+edited. All behavior change ships as out-of-tree plugins. Fork only on
+purpose, temporarily, when something is impossible through extension
+points.
 
-```text
-Tauri multi-Webview feels native and agent control works
-→ continue with Tauri
+The clone must be installed **and built**: per-user profile fallbacks
+link into workspace `lib/` output, so an unbuilt tree fails with
+`ERR_MODULE_NOT_FOUND`. The shell pre-flights (`node_modules` +
+`apps/cli/lib/bin.js`) and refuses with the exact fix instead of
+spawning into that failure; the provisioner and updater both build.
+
+Settings → **Upgrade dsh**: check fetches the tracked branch (safe
+while running) and reports up-to-date / behind (N commits) / diverged /
+dev-mode. Behind + confirm spawns the updater detached, kills the
+child, and exits; the updater fast-forward-merges, installs, builds
+(`reset --hard` rollback on install/build failure), relaunches the
+shell, and leaves a status file the next boot toasts once. Refused
+outside the packaged backend — custom checkouts update with plain git.
+
+Browser/backend skew: at boot the shell probes `--version` and compares
+against the staged dsh-browser copy's `dsh.engines.backend` range.
+Match → `Backend: … ✓` in Settings, silent. Mismatch → the label names
+the gap plus one warning toast (`Browser tab unavailable… Chat is
+unaffected`); the app runs on without the tab. Warn-only, always —
+for packaged and custom alike.
+
+The shell pins its child's frame server (`DSH_BROWSER_FRAME_PORT`,
+default 9453) and answers panel discovery with identity, so every
+Browser tab uses its own frame server and foreign rect reports are
+acked but never steer the overlay.
+
+Downloads: WebView2 doesn't save files on its own, so both views carry
+a download hook — session exports land in `%USERPROFILE%\Downloads` as
+`dsh-session-<id>.zip` (upstream's convention), anything else keeps its
+URL last segment, and each finish pops a small auto-dismissing toast.
+
+## Security model
+
+The control plane is loopback-only with no auth: any process running as
+your user can drive it (navigate, eval, restart, upgrade). That is the
+entire trust boundary — same-user. It is not reachable from the
+network, and app code treats it as local-only. The updater only ever
+runs inside the packaged dir; it never touches a custom checkout (not
+fetch, not merge, never `reset --hard`).
+
+## Development
+
+```sh
+cargo build            # debug binary -> target/debug/dsh-desktop.exe
+$env:DSH_SRC = "<your dsh checkout>"
+$env:DSH_BIN = "<this-repo>/dsh.cmd"   # dev shim, requires DSH_SRC
+./target/debug/dsh-desktop
 ```
 
-Phase-1 agent loop (observation/action on the exact same WebView2) is
-proven end-to-end through the shipped `dsh-browser` tools; evidence and
-per-finding notes live in `experiment/` (`live-loop.mjs`,
-`tool-level.mjs`, `visible-path.mjs`, `form.html`, shots) and the
-`dsh-browser` README. No Rust changes were needed beyond the experiment
-scaffold — the `/navigate|/eval|/cdp|/state` plane proved sufficient.
+Layout: `src/main.rs` (shell), `src/platform.rs` (every OS assumption —
+the macOS/Linux port touches this file plus script twins),
+`packaging/` (reproducible backend provisioning: install script, updater
+template, porting notes), `experiment/` (throwaway drive scripts, not
+part of the product), `dsh.cmd` (dev-only shim, never shipped).
 
-Report with the decision: files changed, bounds-sync path, show/hide path,
-WebView2/CDP access path, coordinate/DPI issues, focus/input problems,
-video behavior, resize feel, and whether it feels materially closer to
-Codex than the screencast canvas.
-
-## What this does NOT do (by design)
-
-Same plugin, both surfaces: `dsh-browser` stays a Node DSH plugin and works
-unchanged under this shell — the shell never sees CDP sessions or tools, only
-one panel rectangle and raw page control. The streamed canvas implementation
-is untouched and remains the fallback under plain `dsh web`.
+Releases: tag `vX.Y.Z` (matches `tauri.conf.json`) → CI builds the
+NSIS installer on a Windows runner → published GitHub release with the
+shell/backend/browser triplet in the notes. Unsigned builds (SmartScreen
+click-through) until signing is set up.
