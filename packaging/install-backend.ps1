@@ -22,7 +22,11 @@ param(
   [string]$Dest = (Join-Path $env:LOCALAPPDATA "dsh-desktop\dsh-src")
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
+# Deliberately NOT Stop: git/pnpm narrate on stderr even on success, and
+# newer PowerShell hosts turn those lines into terminating errors under
+# Stop (measured: the script died on git's own "Cloning into..." line).
+# Every native step below checks $LASTEXITCODE explicitly instead.
 
 function Need($name) {
   if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
