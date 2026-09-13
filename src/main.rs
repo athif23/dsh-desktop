@@ -33,6 +33,8 @@ use tauri_plugin_dialog::DialogExt;
 use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
 use windows::core::HSTRING;
 
+mod platform;
+
 /// First `dsh web:` startup line wins; the URL carries the process token.
 const STARTUP_PREFIX: &str = "dsh web: ";
 /// How long to wait for the child to print its URL before killing it.
@@ -145,12 +147,10 @@ fn free_port() -> std::io::Result<u16> {
 
 /// Home of the installer-packaged dsh backend: a clone of the tracked fork
 /// plus `dsh-manifest.json` (remote/branch/commit) and the generated
-/// `dsh-packaged.cmd` launcher. `%LOCALAPPDATA%` keeps it per-user so
-/// backend updates never need elevation.
+/// launcher. Per-user dir (see `platform`) so backend updates never need
+/// elevation.
 fn packaged_dir() -> Option<std::path::PathBuf> {
-    std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(|base| std::path::Path::new(&base).join("dsh-desktop").join("dsh-src"))
+    platform::packaged_dir()
 }
 
 /// The install-time record of which fork/branch the packaged backend tracks.
@@ -262,9 +262,7 @@ fn check_backend_update() -> serde_json::Value {
 
 /// Where the detached updater leaves its result for the next boot to toast.
 fn update_status_path() -> Option<std::path::PathBuf> {
-    std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(|base| std::path::Path::new(&base).join("dsh-desktop").join("update-status.json"))
+    platform::update_status_path()
 }
 
 /// One-line result toast for the updater (same injected-DOM channel and
@@ -305,14 +303,14 @@ fn dsh_bin() -> (String, &'static str) {
         }
     }
     if let Some(dir) = packaged_dir() {
-        let launcher = dir.join("dsh-packaged.cmd");
+        let launcher = platform::packaged_launcher_file(&dir);
         if launcher.is_file() {
             return (launcher.to_string_lossy().into_owned(), "packaged backend");
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let shim = dir.join("dsh.cmd");
+            let shim = platform::dev_shim_file(dir);
             if shim.is_file() {
                 return (shim.to_string_lossy().into_owned(), "sibling dsh.cmd");
             }
@@ -346,9 +344,7 @@ fn packaged_backend_ready(dir: &std::path::Path) -> Result<(), String> {
 /// metadata from (its `package.json` `dsh.engines.backend` range). Staged
 /// beside the backend at provision time; refreshed on shell releases.
 fn bundled_browser_dir() -> Option<std::path::PathBuf> {
-    std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(|base| std::path::Path::new(&base).join("dsh-desktop").join("dsh-browser"))
+    platform::bundled_browser_dir()
 }
 
 /// Last browser/backend compatibility verdict, shown in the Settings menu.
@@ -1624,9 +1620,9 @@ fn serve_control(
                         json_response(&mut stream, 200, r#"{"ok":false,"error":"packaged backend has no manifest"}"#);
                         return;
                     };
-                    let updater = dir.join("updater.cmd");
+                    let updater = platform::updater_file(&dir);
                     if !updater.is_file() {
-                        json_response(&mut stream, 200, r#"{"ok":false,"error":"updater.cmd missing from packaged backend"}"#);
+                        json_response(&mut stream, 200, r#"{"ok":false,"error":"updater script missing from packaged backend"}"#);
                         return;
                     }
                     // The updater's git commands need the remote name; the
