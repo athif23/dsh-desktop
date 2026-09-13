@@ -35,11 +35,17 @@ function Need($name) {
 }
 Need git; Need node; Need pnpm
 
-if ((Test-Path (Join-Path $Dest "dsh-manifest.json"))) {
-  throw "already provisioned at $Dest (dsh-manifest.json exists); updates go through Settings → Upgrade dsh"
-}
-if ((Test-Path $Dest) -and ((Get-ChildItem $Dest -Force | Measure-Object).Count -gt 0)) {
-  throw "refusing: $Dest exists and is not empty"
+if ((Test-Path $Dest)) {
+  if ((Test-Path (Join-Path $Dest "dsh-manifest.json"))) {
+    throw "already provisioned at $Dest (dsh-manifest.json exists); updates go through Settings → Upgrade dsh"
+  }
+  # Same policy as the shell's provisioner: residue without a manifest is a
+  # failed attempt (clone/install/build died midway) — clear it so retry
+  # heals instead of refusing.
+  if (((Get-ChildItem $Dest -Force | Measure-Object).Count) -gt 0) {
+    Write-Host "clearing incomplete previous attempt at $Dest"
+    Remove-Item -Recurse -Force $Dest
+  }
 }
 
 git clone --branch $Branch --single-branch $Remote $Dest
