@@ -138,6 +138,16 @@ struct WindowBody {
     action: String,
 }
 
+/// `POST /setup-start` body: `bundled` provisions from upstream, `custom`
+/// adopts the user's checkout at `path` (validated before saving).
+#[derive(Debug, Deserialize)]
+struct SetupBody {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
 /// Pick an explicit loopback port so two shells (or a manual `dsh web`) never
 /// fight over the default. Binds :0, reads the port back, releases it.
 fn free_port() -> std::io::Result<u16> {
@@ -292,50 +302,97 @@ fn show_note_toast(app: &tauri::AppHandle, title: &str, body: &str, ok: bool) {
     });
 }
 
-fn dsh_bin() -> (String, &'static str) {
-    // Explicit env wins (dev against a live checkout); otherwise the
-    // installer-packaged backend; otherwise a `dsh.cmd` sitting next to the
-    // shell binary (the experiment checkout layout) so double-clicking the
-    // exe works; last resort is PATH.
+/// How to spawn the backend: an opaque launcher/bin, or a dsh checkout
+/// dir launched as `node --import tsx/esm apps/cli/src/bin.ts` with cwd.
+enum BackendSpawn {
+    Bin(String),
+    NodeDir(std::path::PathBuf),
+}
+
+fn dsh_bin() -> (Option<BackendSpawn>, &'static str) {
+    // Explicit env wins (dev against a live checkout); then the settings
+    // custom dir; otherwise the installer-packaged backend; otherwise a
+    // `dsh.cmd` sitting next to the shell binary (the experiment checkout
+    // layout) so double-clicking the exe works; then PATH; else nothing
+    // (first-run setup mode).
     if let Ok(from_env) = std::env::var("DSH_BIN") {
         if !from_env.trim().is_empty() {
-            return (from_env, "env DSH_BIN");
+            return (Some(BackendSpawn::Bin(from_env)), "env DSH_BIN");
+        }
+    }
+    if let Ok(slot) = shell_settings().lock() {
+        if let Some(choice) = slot.backend.clone() {
+            if choice.kind == "custom" {
+                let dir = choice.path.unwrap_or_default();
+                let dir = std::path::PathBuf::from(&dir);
+                if !custom_dir_usable(&dir) {
+                    return (None, "custom backend (missing)");
+                }
+                // Installed + built is checked here (cheap path probes) so
+                // a checkout the user later breaks lands in setup with
+                // guidance instead of a dead exit.
+                if packaged_backend_ready(&dir, false).is_err() {
+                    return (None, "custom backend (unusable)");
+                }
+                return (Some(BackendSpawn::NodeDir(dir)), "custom backend");
+            }
         }
     }
     if let Some(dir) = packaged_dir() {
         let launcher = platform::packaged_launcher_file(&dir);
         if launcher.is_file() {
-            return (launcher.to_string_lossy().into_owned(), "packaged backend");
+            // A launcher with an unready tree is a failed provision or a
+            // half-removed backend: setup mode, not a dead exit — the card
+            // offers wipe-and-retry.
+            if packaged_backend_ready(&dir, true).is_err() {
+                return (None, "packaged backend (unfinished)");
+            }
+            return (Some(BackendSpawn::Bin(launcher.to_string_lossy().into_owned())), "packaged backend");
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let shim = platform::dev_shim_file(dir);
             if shim.is_file() {
-                return (shim.to_string_lossy().into_owned(), "sibling dsh.cmd");
+                return (Some(BackendSpawn::Bin(shim.to_string_lossy().into_owned())), "sibling dsh.cmd");
             }
         }
     }
-    ("dsh".to_string(), "PATH")
+    if platform::find_on_path("dsh").is_some() {
+        return (Some(BackendSpawn::Bin("dsh".to_string())), "PATH");
+    }
+    (None, "none")
 }
 
-/// Pre-flight for the packaged backend: the per-user profiles fallback
-/// links at boot into this clone's workspace `lib/` output, so a clone
-/// that was never `pnpm install`ed + built fails with a confusing
-/// `ERR_MODULE_NOT_FOUND` deep in plugin load (measured). Refuse early
-/// with the exact fix instead.
-fn packaged_backend_ready(dir: &std::path::Path) -> Result<(), String> {
+/// A custom backend dir is usable when it looks like a dsh checkout with
+/// the entry point present. Deep readiness (installed + built) is checked
+/// at spawn; this gate only decides whether setup mode is needed.
+fn custom_dir_usable(dir: &std::path::Path) -> bool {
+    dir.join("apps").join("cli").join("src").join("bin.ts").is_file()
+}
+
+/// Pre-flight for a dsh checkout dir (packaged clone or custom): the
+/// per-user profiles fallback links at boot into the checkout's workspace
+/// `lib/` output, so a tree that was never `pnpm install`ed + built fails
+/// with a confusing `ERR_MODULE_NOT_FOUND` deep in plugin load (measured).
+/// Refuse early with the exact fix instead. `ours` selects the wording:
+/// packaged (shell-owned, Upgrade fixes it) vs custom (user-owned).
+fn packaged_backend_ready(dir: &std::path::Path, ours: bool) -> Result<(), String> {
+    let (who, fix) = if ours {
+        ("packaged backend", "run pnpm install inside it (or Upgrade dsh once running)")
+    } else {
+        ("custom backend", "run pnpm install inside it")
+    };
     if !dir.join("node_modules").is_dir() {
-        return Err(format!(
-            "packaged backend at {} has no node_modules: run pnpm install inside it (or Upgrade dsh once running)",
-            dir.display()
-        ));
+        return Err(format!("{who} at {} has no node_modules: {fix}", dir.display()));
     }
+    let (who, fix) = if ours {
+        ("packaged backend", "run pnpm run build inside it (or Upgrade dsh once running)")
+    } else {
+        ("custom backend", "run pnpm run build inside it")
+    };
     if !dir.join("apps").join("cli").join("lib").join("bin.js").is_file() {
-        return Err(format!(
-            "packaged backend at {} was never built (workspace lib/ missing): run pnpm run build inside it (or Upgrade dsh once running)",
-            dir.display()
-        ));
+        return Err(format!("{who} at {} was never built (workspace lib/ missing): {fix}", dir.display()));
     }
     Ok(())
 }
@@ -444,32 +501,331 @@ fn backend_version(dir: &std::path::Path) -> Option<String> {
 }
 
 /// Compare the running backend against the staged dsh-browser's tested
-/// range. Custom (non-packaged) backends are self-managed: labeled, never
-/// judged, never touched. Returns the menu label plus an optional
-/// (backend version, requirement) mismatch pair.
+/// range. Packaged and custom checkouts are both probed (warn-only on
+/// mismatch); anything else is labeled self-managed and left alone.
+/// Returns the menu label plus an optional (backend version, requirement)
+/// mismatch pair. The updater still refuses everything but packaged.
 fn check_browser_compat() -> (String, Option<(String, String)>) {
     let (_, source) = dsh_bin();
-    if source != "packaged backend" {
+    let (kind, dir) = if source == "packaged backend" {
+        ("packaged", packaged_dir())
+    } else if source == "custom backend" {
+        let dir = shell_settings()
+            .lock()
+            .ok()
+            .and_then(|s| s.backend.clone())
+            .and_then(|b| b.path)
+            .map(std::path::PathBuf::from);
+        ("custom", dir)
+    } else {
         return (format!("Backend: {source} (self-managed)"), None);
-    }
+    };
     let requirement = bundled_browser_dir()
         .and_then(|d| std::fs::read_to_string(d.join("package.json")).ok())
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|v| v.pointer("/dsh/engines/backend").and_then(|r| r.as_str()).map(str::to_string));
-    let (Some(requirement), Some(dir)) = (requirement, packaged_dir()) else {
-        return ("Backend: packaged · compatibility unknown".to_string(), None);
+    let (Some(requirement), Some(dir)) = (requirement, dir) else {
+        return (format!("Backend: {kind} · compatibility unknown"), None);
     };
     match backend_version(&dir) {
         Some(version) => match requirement_satisfied(&requirement, &version) {
-            Some(true) => (format!("Backend: packaged · {version} ✓"), None),
+            Some(true) => (format!("Backend: {kind} · {version} ✓"), None),
             Some(false) => (
-                format!("Backend: packaged · {version} — browser needs {requirement}"),
+                format!("Backend: {kind} · {version} — browser needs {requirement}"),
                 Some((version, requirement)),
             ),
-            None => ("Backend: packaged · version unknown".to_string(), None),
+            None => (format!("Backend: {kind} · version unknown"), None),
         },
-        None => ("Backend: packaged · version unknown".to_string(), None),
+        None => (format!("Backend: {kind} · version unknown"), None),
     }
+}
+
+/// First-run setup, entered when no usable backend resolves and no
+/// DSH_BIN is set. Shell-owned UI — no DSH page exists yet — so the
+/// shellbar view goes full-window with the choice card below; the bundled
+/// provision runs on a worker thread with polled progress; success
+/// relaunches into normal boot.
+const UPSTREAM_REMOTE: &str = "https://github.com/deepseek-ai/deepseek-harness.git";
+const UPSTREAM_BRANCH: &str = "master";
+const PACKAGED_LAUNCHER_TEXT: &str = "@echo off\r\nrem Generated at install: launch the packaged dsh backend (no checkout needed).\r\ncd /d %~dp0\r\nnode --import tsx/esm apps/cli/src/bin.ts %*\r\n";
+
+fn setup_flag_path() -> Option<std::path::PathBuf> {
+    platform::app_data_dir().map(|d| d.join("setup.pending"))
+}
+
+static SETUP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn setup_mode() -> bool {
+    SETUP_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[derive(Clone, Default)]
+struct ProvisionState {
+    phase: String,
+    log: Vec<String>,
+    done: bool,
+    error: Option<String>,
+}
+
+static PROVISION: std::sync::LazyLock<Mutex<ProvisionState>> =
+    std::sync::LazyLock::new(|| Mutex::new(ProvisionState::default()));
+
+fn prov_log(line: String) {
+    let line = line.chars().take(300).collect::<String>();
+    eprintln!("[setup] {line}");
+    if let Ok(mut s) = PROVISION.lock() {
+        s.log.push(line);
+        if s.log.len() > 60 {
+            let drop = s.log.len() - 60;
+            s.log.drain(..drop);
+        }
+    }
+}
+
+fn prov_phase(phase: &str) {
+    prov_log(format!("—— {phase}"));
+    if let Ok(mut s) = PROVISION.lock() {
+        s.phase = phase.to_string();
+    }
+}
+
+/// One provision step: run, keep the tail in the card log, fail loud.
+fn run_step(dir: &std::path::Path, prog: &std::path::Path, args: &[&str], phase: &str) -> Result<(), String> {
+    prov_phase(phase);
+    let out = std::process::Command::new(prog)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("could not start {}: {e}", prog.display()))?;
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tail: Vec<&str> = combined.lines().filter(|l| !l.trim().is_empty()).collect();
+    for line in tail.iter().rev().take(4).rev() {
+        prov_log(format!("| {line}"));
+    }
+    if !out.status.success() {
+        return Err(format!("{} {} failed", prog.display(), args.join(" ")));
+    }
+    Ok(())
+}
+
+fn resolve_tool(name: &str, why: &str) -> Result<std::path::PathBuf, String> {
+    // Prefer a directly executable image: PATH shims (extensionless Node
+    // entry scripts, .ps1) are listed by `where` but CreateProcess
+    // rejects them — measured with pnpm (os error 193).
+    platform::find_on_path_all(name)
+        .into_iter()
+        .find(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref(),
+                Some("exe") | Some("cmd") | Some("bat") | Some("com")
+            )
+        })
+        .ok_or_else(|| format!("no executable {name} on PATH ({why}) — install it, then retry"))
+}
+
+fn provision_bundled() {
+    if PROVISION.lock().map(|s| !s.phase.is_empty() && !s.done).unwrap_or(false) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let started = std::time::Instant::now();
+        // Heartbeat: install/build are minute-scale silences otherwise.
+        std::thread::spawn(move || {
+            for _ in 0..40 {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let finished = PROVISION.lock().map(|s| s.done).unwrap_or(true);
+                if finished {
+                    return;
+                }
+                prov_log(format!("… still working ({}s elapsed)", started.elapsed().as_secs()));
+            }
+        });
+        let result = provision_bundled_inner();
+        if let Ok(mut s) = PROVISION.lock() {
+            s.done = true;
+            match &result {
+                Ok(sha) => s.phase = format!("Ready ({sha}) — relaunching…"),
+                Err(e) => {
+                    s.phase = "Failed".to_string();
+                    s.error = Some(e.clone());
+                }
+            }
+        }
+        if result.is_ok() {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            relaunch_self();
+        }
+    });
+}
+
+fn provision_bundled_inner() -> Result<String, String> {
+    let git = resolve_tool("git", "Git")?;
+    let node = resolve_tool("node", "Node.js 22+")?;
+    let pnpm = resolve_tool("pnpm", "pnpm")?;
+    let dest = packaged_dir().ok_or("cannot locate the app-data dir")?;
+    // An unready tree — with or without a manifest — is a failed attempt
+    // (clone/install/build died midway): wipe and redo so retry heals. A
+    // ready tree is never reinstalled — updates go through Upgrade dsh.
+    if dest.exists() && packaged_backend_ready(&dest, true).is_err() {
+        prov_phase("Clearing the failed attempt");
+        std::fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
+    }
+    if dest.join("dsh-manifest.json").is_file() {
+        return Err("already provisioned — backend updates go through Settings → Upgrade dsh".to_string());
+    }
+    if dest.exists() {
+        return Err(format!(
+            "{} exists but is not a provisioned backend — delete it or pick a custom backend",
+            dest.display()
+        ));
+    }
+    let parent = dest.parent().ok_or("packaged dir has no parent")?.to_path_buf();
+    std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
+    let dest_arg = dest.to_string_lossy().into_owned();
+    run_step(&parent, &git, &["clone", "--branch", UPSTREAM_BRANCH, "--single-branch", UPSTREAM_REMOTE, &dest_arg], "Cloning upstream dsh")?;
+    let sha = git_out(&dest, &["rev-parse", "HEAD"])?;
+    prov_phase("Writing launcher + updater");
+    let manifest = serde_json::json!({"remote": UPSTREAM_REMOTE, "branch": UPSTREAM_BRANCH, "commit": sha});
+    std::fs::write(dest.join("dsh-manifest.json"), serde_json::to_string_pretty(&manifest).unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    let launcher_name = platform::packaged_launcher_file(&dest)
+        .file_name().map(|n| n.to_owned()).ok_or("launcher name")?;
+    std::fs::write(dest.join(launcher_name), PACKAGED_LAUNCHER_TEXT).map_err(|e| e.to_string())?;
+    std::fs::write(platform::updater_file(&dest), include_str!("../packaging/updater.cmd.template"))
+        .map_err(|e| e.to_string())?;
+    let exclude = dest.join(".git").join("info").join("exclude");
+    let mut prev = std::fs::read_to_string(&exclude).unwrap_or_default();
+    for name in ["dsh-manifest.json", &platform::packaged_launcher_file(&dest).file_name().unwrap().to_string_lossy().into_owned(), &platform::updater_file(&dest).file_name().unwrap().to_string_lossy().into_owned()] {
+        if !prev.contains(name) {
+            prev.push_str(&format!("\n{name}"));
+        }
+    }
+    std::fs::write(&exclude, prev).map_err(|e| e.to_string())?;
+    run_step(&dest, &pnpm, &["install"], "Installing dependencies (pnpm install)")?;
+    run_step(&dest, &pnpm, &["run", "build"], "Building the backend (pnpm run build)")?;
+    let _ = node;
+    packaged_backend_ready(&dest, true)?;
+    if let Some(flag) = setup_flag_path() {
+        let _ = std::fs::remove_file(flag);
+    }
+    Ok(short_sha(&sha))
+}
+
+/// Relaunch the shell exe detached, then exit. Used after setup completes
+/// and when entering setup from the menu. Port: windows `start`; POSIX
+/// needs its own detach here (see `platform`).
+fn relaunch_self() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &exe.to_string_lossy()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    std::process::exit(0);
+}
+
+/// Validate a user-picked custom dir: looks like dsh, installed, built.
+/// Their checkout, their updates — the shell only checks it can boot.
+fn validate_custom_dir(path: &str) -> Result<String, String> {
+    let dir = std::path::PathBuf::from(path.trim());
+    if !dir.is_dir() {
+        return Err("that folder does not exist".to_string());
+    }
+    if !custom_dir_usable(&dir) {
+        return Err("not a dsh checkout (apps/cli/src/bin.ts missing)".to_string());
+    }
+    packaged_backend_ready(&dir, false)?;
+    let version = backend_version(&dir).unwrap_or_else(|| "unknown version".to_string());
+    Ok(version)
+}
+
+/// One-line setup-card state: what boots today, or why nothing does.
+fn setup_state_text() -> String {
+    let (spawn, source) = dsh_bin();
+    match spawn {
+        Some(BackendSpawn::Bin(_)) => format!("Current backend: {source}"),
+        Some(BackendSpawn::NodeDir(d)) => format!("Current backend: {source} at {}", d.display()),
+        None => match source {
+            "custom backend (missing)" => "Your custom backend folder is missing — pick again or install bundled.".to_string(),
+            "custom backend (unusable)" => "Your custom backend is no longer installed + built (run pnpm install / build there) — fix it, pick again, or install bundled.".to_string(),
+            "packaged backend (unfinished)" => "The packaged backend never finished installing — choose Install bundled to wipe and retry.".to_string(),
+            _ => "No dsh backend found on this machine.".to_string(),
+        },
+    }
+}
+
+/// (`GET /setup`): first-run card. Same visual language as the shellbar;
+/// `__BASE__` placeholder like `shellbar_html` (avoids format! doubling).
+fn setup_html() -> String {
+    const PAGE: &str = r#"<!doctype html><html><head><meta charset=utf-8><title>dsh-desktop setup</title>
+<style>
+html,body{margin:0;padding:0;min-height:100%;background:#141414;color:#eee;font:13px 'Segoe UI',sans-serif}
+#head{display:flex;align-items:center;gap:8px;height:32px;padding:0 0 0 10px;user-select:none}
+#brand{color:#888;font-weight:600}
+#wins{margin-left:auto;display:flex;height:32px}
+.winbtn{background:none;border:none;width:46px;color:#ccc;font-size:11px;cursor:pointer}
+.winbtn:hover{background:#3a3a3a}
+#cls:hover{background:#c42b1c;color:#fff}
+#card{max-width:560px;margin:8vh auto 40px;background:#1e1e1e;border:1px solid #3a3a3a;border-radius:12px;padding:26px 30px;box-sizing:border-box}
+h1{font-size:18px;margin:0 0 6px}
+#state{color:#9a9a9a;font-size:12px;margin-bottom:18px}
+.opt{display:block;width:100%;text-align:left;background:#2d2d2d;color:#eee;border:1px solid #4a4a4a;border-radius:8px;padding:12px 14px;font-size:13px;cursor:pointer;margin-bottom:10px;font-family:inherit}
+.opt:hover{background:#3a3a3a}
+.opt small{display:block;color:#9a9a9a;font-size:11px;margin-top:3px}
+#cpath{display:none;margin:4px 0 10px}
+#cpath input{width:100%;background:#0d0d0d;color:#eee;border:1px solid #4a4a4a;border-radius:6px;padding:7px 10px;font-size:12px;font-family:inherit;box-sizing:border-box;margin-bottom:8px}
+.row{display:flex;gap:8px}
+button{background:#2d2d2d;color:#eee;border:1px solid #4a4a4a;border-radius:6px;padding:6px 14px;font-size:12px;cursor:pointer;font-family:inherit}
+button:hover{background:#3a3a3a}
+button:disabled{opacity:.5;cursor:default}
+#phase{color:#9a9a9a;font-size:12px;margin:14px 0 6px;min-height:16px}
+#log{background:#0d0d0d;border:1px solid #2e2e2e;border-radius:8px;padding:10px 12px;font:11px Consolas,monospace;white-space:pre-wrap;max-height:220px;overflow-y:auto;min-height:60px;color:#bbb}
+#cancel{display:block;margin:16px auto 0;background:none;border:none;color:#777;font-size:12px;cursor:pointer}
+#cancel:hover{color:#ccc}
+</style></head><body>
+<div id=head><span id=brand>dsh-desktop setup</span><span id=wins><button class=winbtn id=min>─</button><button class=winbtn id=max>▢</button><button class=winbtn id=cls>✕</button></span></div>
+<div id=card><h1>Choose your dsh backend</h1><div id=state></div>
+<button class=opt id=b-bundled>Install bundled dsh (recommended)<small>Clones upstream, installs, builds. Updates arrive via Settings → Upgrade dsh.</small></button>
+<button class=opt id=b-custom>Use my own dsh<small>You update it yourself with plain git. The shell never touches it.</small></button>
+<div id=cpath><input id=pin readonly placeholder="No folder chosen yet"><div class=row><button id=browse>Browse…</button><button id=use>Use this folder</button></div></div>
+<div id=phase></div><div id=log></div>
+<button id=cancel>Cancel</button>
+</div><script>
+(function(){
+var base='__BASE__';
+function post(p,b){return fetch(base+p,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b||{})}).then(function(r){return r.json()})}
+document.getElementById('min').onclick=function(){post('/window',{action:'minimize'})};
+document.getElementById('max').onclick=function(){post('/window',{action:'toggle-max'})};
+document.getElementById('cls').onclick=function(){post('/window',{action:'close'})};
+var head=document.getElementById('head');var dp=null;
+head.addEventListener('mousedown',function(e){if(e.button!==0)return;if(e.target.closest('button'))return;dp=[e.clientX,e.clientY]});
+head.addEventListener('mousemove',function(e){if(!dp)return;if(Math.abs(e.clientX-dp[0])+Math.abs(e.clientY-dp[1])>5){dp=null;fetch(base+'/drag-start',{method:'POST'})}});
+head.addEventListener('mouseup',function(){dp=null});
+var phase=document.getElementById('phase'),log=document.getElementById('log'),state=document.getElementById('state');
+var cpath=document.getElementById('cpath'),pin=document.getElementById('pin');
+var busy=false;
+document.getElementById('b-bundled').onclick=function(){
+if(busy)return;busy=true;phase.textContent='Starting…';
+post('/setup-start',{kind:'bundled'}).then(function(r){if(r.error){busy=false;phase.textContent='Failed: '+r.error}}).catch(function(){busy=false;phase.textContent='Shell unreachable'})};
+document.getElementById('b-custom').onclick=function(){cpath.style.display='block'};
+document.getElementById('browse').onclick=function(){post('/setup-pick',{}).then(function(r){if(r.path)pin.value=r.path})};
+document.getElementById('use').onclick=function(){
+if(busy||!pin.value)return;busy=true;phase.textContent='Validating…';
+post('/setup-start',{kind:'custom',path:pin.value}).then(function(r){if(r.error){busy=false;phase.textContent='Not usable: '+r.error}else{phase.textContent='Accepted — relaunching…'}}).catch(function(){busy=false;phase.textContent='Shell unreachable'})};
+document.getElementById('cancel').onclick=function(){post('/setup-cancel',{})};
+setInterval(function(){fetch(base+'/setup-status').then(function(r){return r.json()}).then(function(s){
+state.textContent=s.state||'';if(s.phase)phase.textContent=s.phase;
+if(s.log)log.textContent=s.log.join('\n');
+if(s.done&&!s.error)phase.textContent=s.phase+' — relaunching…';
+if(s.done&&s.error){busy=false;phase.textContent='Failed: '+s.error}}).catch(function(){})},1000);
+})();
+</script></body></html>"#;
+    PAGE.replace("__BASE__", &format!("http://{CONTROL_ADDR}"))
 }
 
 /// Spawn `dsh web --no-open --port <free>` and wait (bounded) for the
@@ -477,20 +833,40 @@ fn check_browser_compat() -> (String, Option<(String, String)>) {
 /// instead of hanging the shell forever.
 fn spawn_dsh(frame_port: u16) -> Result<(Child, String, u16), String> {
     let port = free_port().map_err(|e| format!("no free loopback port: {e}"))?;
-    let (bin, source) = dsh_bin();
-    eprintln!("[browser] dsh backend: {bin} ({source})");
+    let (spawn, source) = dsh_bin();
+    // Build the full child command per backend kind, sharing one stdio +
+    // startup-line tail below. NodeDir (custom checkout) runs source mode
+    // with cwd; everything else spawns its launcher with argv.
+    let (mut cmd, label) = match spawn {
+        Some(BackendSpawn::Bin(bin)) => {
+            let mut c = Command::new(&bin);
+            c.args(["web", "--no-open", "--port", &port.to_string()]);
+            (c, bin)
+        }
+        Some(BackendSpawn::NodeDir(dir)) => {
+            let label = dir.display().to_string();
+            packaged_backend_ready(&dir, false)?;
+            let mut c = Command::new("node");
+            c.arg("--import")
+                .arg("tsx/esm")
+                .args(["apps/cli/src/bin.ts", "web", "--no-open", "--port", &port.to_string()])
+                .current_dir(&dir);
+            (c, label)
+        }
+        None => return Err("no dsh backend found (first-run setup never completed)".to_string()),
+    };
+    eprintln!("[browser] dsh backend: {label} ({source})");
     if source == "packaged backend" {
         if let Some(dir) = packaged_dir() {
-            packaged_backend_ready(&dir)?;
+            packaged_backend_ready(&dir, true)?;
         }
     }
-    let mut child = Command::new(&bin)
-        .args(["web", "--no-open", "--port", &port.to_string()])
+    let mut child = cmd
         .env("DSH_BROWSER_FRAME_PORT", frame_port.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not start `{bin}`: {e}"))?;
+        .map_err(|e| format!("could not start `{label}`: {e}"))?;
 
     // Drain stderr on a thread so a chatty child can never block on a pipe.
     if let Some(stderr) = child.stderr.take() {
@@ -745,6 +1121,7 @@ fn settings_menu_js() -> String {
         else if(r.status==='diverged'){{upg.textContent='Local copy diverged';setTimeout(function(){{upg.textContent='Upgrade dsh'}},1800)}}\
         else if(r.status==='devmode'){{upg.textContent='Dev checkout mode';setTimeout(function(){{upg.textContent='Upgrade dsh'}},1500)}}\
         else{{upg.textContent='Check failed';setTimeout(function(){{upg.textContent='Upgrade dsh'}},1500)}}}}).catch(function(){{upg.textContent='Check failed';setTimeout(function(){{upg.textContent='Upgrade dsh'}},1500)}})}};\
+        var bnd=item('Backend…');bnd.onclick=function(){{if(!confirm('Reopen backend setup? The shell will relaunch.'))return;closeMenu();post('/backend-setup',{{}})}};\
         function hold(b,t){{b.disabled=true;if(!b._t)b._t=b.textContent;b.textContent=t}}\
         function back(b,f){{if(f){{b.textContent=f;setTimeout(function(){{b.textContent=b._t;b.disabled=false}},1200)}}else{{b.textContent=b._t;b.disabled=false}}}}\
         function savePath(v){{hold(ch,'Saving…');post('/settings',{{downloadDir:v}}).then(function(r){{if(r.error){{back(ch,'Save failed')}}else{{back(ch,'Saved ✓');refresh()}}}}).catch(function(){{back(ch,'Save failed')}})}}\
@@ -906,7 +1283,9 @@ fn layout_shell(
     let scale = window.scale_factor().unwrap_or(1.0).max(0.01);
     let w = (size.width as f64 / scale).clamp(1.0, 8000.0);
     let h = (size.height as f64 / scale).clamp(1.0, 8000.0);
-    let bar_h = SHELLBAR_H;
+    // Setup mode: the shellbar view owns the whole client area (choice
+    // card); normal mode keeps the 32px strip + DSH page split.
+    let bar_h = if setup_mode() { h } else { SHELLBAR_H };
     if let Some(bar) = window.get_webview("shellbar") {
         let _ = bar.set_bounds(Rect {
             position: LogicalPosition::new(0.0, 0.0).into(),
@@ -1102,11 +1481,26 @@ struct ShellIds {
 }
 
 /// Persisted shell knobs (APPDATA JSON). Only what the shell itself owns:
-/// today just the download folder. Everything else stays DSH-upstream.
+/// the download folder and the backend choice. Everything else stays
+/// DSH-upstream.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ShellSettings {
     #[serde(default, rename = "downloadDir")]
     download_dir: Option<String>,
+    #[serde(default)]
+    backend: Option<BackendChoice>,
+}
+
+/// First-run backend choice. `bundled` = provision from upstream (default);
+/// `custom` = use the user's own dsh checkout at `path`, which they update
+/// themselves — the shell uses it, validates it boots, otherwise leaves it
+/// alone (never fetch/merge/reset outside the packaged dir).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct BackendChoice {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 fn settings_path() -> std::path::PathBuf {
@@ -1117,7 +1511,8 @@ fn settings_path() -> std::path::PathBuf {
 
 static SHELL_SETTINGS: std::sync::OnceLock<Mutex<ShellSettings>> = std::sync::OnceLock::new();
 
-/// Settings, loaded once at first use; POST /settings replaces + persists.
+/// Settings, loaded once at first use; mutate through
+/// `update_shell_settings` so one knob never wipes another.
 fn shell_settings() -> &'static Mutex<ShellSettings> {
     SHELL_SETTINGS.get_or_init(|| {
         let loaded: ShellSettings = std::fs::read_to_string(settings_path())
@@ -1126,6 +1521,18 @@ fn shell_settings() -> &'static Mutex<ShellSettings> {
             .unwrap_or_default();
         Mutex::new(loaded)
     })
+}
+
+/// Load-modify-save under one lock; the file holds every knob, so every
+/// writer goes through here (a fresh-struct write would drop the rest).
+fn update_shell_settings(f: impl FnOnce(&mut ShellSettings)) -> Result<(), String> {
+    let mut slot = shell_settings().lock().map_err(|e| e.to_string())?;
+    f(&mut slot);
+    let text = serde_json::to_string_pretty(&*slot).map_err(|e| e.to_string())?;
+    if let Some(parent) = settings_path().parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(settings_path(), text).map_err(|e| e.to_string())
 }
 
 /// Minimal loopback control plane for the experiment. No auth (loopback
@@ -1166,6 +1573,143 @@ fn serve_control(
                 "GET /health" => json_response(&mut stream, 200, r#"{"ok":true}"#),
                 // Shell toolbar strip page for the setup-time child WebView.
                 "GET /shellbar" => html_response(&mut stream, &shellbar_html()),
+                // First-run setup card (the shellbar view goes full-window;
+                // no DSH page exists yet, so all of this is shell-owned).
+                "GET /setup" => html_response(&mut stream, &setup_html()),
+                "GET /setup-status" => {
+                    let (phase, log, done, error) = PROVISION
+                        .lock()
+                        .map(|s| (s.phase.clone(), s.log.clone(), s.done, s.error.clone()))
+                        .unwrap_or_default();
+                    let tail: Vec<String> =
+                        log.into_iter().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect();
+                    let out = serde_json::json!({
+                        "phase": phase, "log": tail, "done": done,
+                        "error": error, "state": setup_state_text(),
+                    });
+                    json_response(&mut stream, 200, &out.to_string());
+                }
+                "POST /setup-pick" => {
+                    let (tx, rx) = mpsc::channel::<Option<String>>();
+                    let handle = app.clone();
+                    let _ = app.run_on_main_thread(move || {
+                        let picked = handle
+                            .dialog()
+                            .file()
+                            .set_title("Choose your dsh checkout")
+                            .blocking_pick_folder()
+                            .map(|p| p.to_string());
+                        let _ = tx.send(picked);
+                    });
+                    match rx.recv_timeout(Duration::from_secs(300)) {
+                        Ok(Some(path)) => {
+                            eprintln!("[setup] picked folder {path}");
+                            json_response(
+                                &mut stream,
+                                200,
+                                &serde_json::json!({"ok": true, "path": path}).to_string(),
+                            )
+                        }
+                        Ok(None) => {
+                            json_response(&mut stream, 200, r#"{"ok":true,"cancelled":true}"#)
+                        }
+                        Err(_) => json_response(
+                            &mut stream,
+                            500,
+                            r#"{"error":"folder picker timed out"}"#,
+                        ),
+                    }
+                }
+                "POST /setup-start" => match serde_json::from_str::<SetupBody>(&body) {
+                    Ok(req) if req.kind == "bundled" => {
+                        provision_bundled();
+                        json_response(&mut stream, 200, r#"{"ok":true,"started":true}"#);
+                    }
+                    Ok(req) if req.kind == "custom" => match req.path {
+                        Some(p) => match validate_custom_dir(&p) {
+                            Ok(version) => {
+                                let saved = p.trim().to_string();
+                                match update_shell_settings(|s| {
+                                    s.backend = Some(BackendChoice {
+                                        kind: "custom".to_string(),
+                                        path: Some(saved.clone()),
+                                    })
+                                }) {
+                                    Ok(()) => {
+                                        eprintln!("[setup] custom backend {saved} ({version})");
+                                        if let Some(flag) = setup_flag_path() {
+                                            let _ = std::fs::remove_file(flag);
+                                        }
+                                        json_response(&mut stream, 200, r#"{"ok":true}"#);
+                                        std::thread::sleep(Duration::from_millis(400));
+                                        relaunch_self();
+                                    }
+                                    Err(e) => json_response(
+                                        &mut stream,
+                                        500,
+                                        &serde_json::json!({"error": e}).to_string(),
+                                    ),
+                                }
+                            }
+                            Err(e) => json_response(
+                                &mut stream,
+                                400,
+                                &serde_json::json!({"error": e}).to_string(),
+                            ),
+                        },
+                        None => json_response(
+                            &mut stream,
+                            400,
+                            r#"{"error":"no folder chosen"}"#,
+                        ),
+                    },
+                    _ => json_response(
+                        &mut stream,
+                        400,
+                        r#"{"error":"unknown setup kind"}"#,
+                    ),
+                },
+                "POST /setup-cancel" => {
+                    if let Some(flag) = setup_flag_path() {
+                        let _ = std::fs::remove_file(flag);
+                    }
+                    json_response(&mut stream, 200, r#"{"ok":true}"#);
+                    let (spawn, _) = dsh_bin();
+                    if spawn.is_some() {
+                        std::thread::sleep(Duration::from_millis(300));
+                        relaunch_self();
+                    } else {
+                        let handle = app.clone();
+                        let _ = app.run_on_main_thread(move || {
+                            if let Some(window) = handle.get_window("main") {
+                                let _ = window.close();
+                            }
+                        });
+                    }
+                }
+                // Menu → Backend…: reopen setup on relaunch (flag survives
+                // the restart; setup offers Cancel back to the current).
+                "POST /backend-setup" => {
+                    let written = setup_flag_path()
+                        .and_then(|flag| {
+                            if let Some(parent) = flag.parent() {
+                                std::fs::create_dir_all(parent).ok()?;
+                            }
+                            std::fs::write(flag, "1").ok()
+                        })
+                        .is_some();
+                    if written {
+                        json_response(&mut stream, 200, r#"{"ok":true}"#);
+                        std::thread::sleep(Duration::from_millis(300));
+                        relaunch_self();
+                    } else {
+                        json_response(
+                            &mut stream,
+                            500,
+                            r#"{"error":"cannot write setup flag"}"#,
+                        );
+                    }
+                }
                 // Frame-server discovery with identity: only our own DSH tab
                 // learns our pinned port; anyone else gets null and keeps its
                 // default (:9333, its own server). No cross-window steering.
@@ -1483,23 +2027,8 @@ fn serve_control(
                         let dir = req.download_dir.trim().to_string();
                         // Empty clears back to the default destination.
                         if dir.is_empty() {
-                            let settings = ShellSettings { download_dir: None };
-                            let persisted = settings_path()
-                                .parent()
-                                .map(std::fs::create_dir_all)
-                                .unwrap_or(Ok(()))
-                                .and_then(|()| {
-                                    std::fs::write(
-                                        settings_path(),
-                                        serde_json::to_string_pretty(&settings)
-                                            .unwrap_or_default(),
-                                    )
-                                });
-                            match persisted {
+                            match update_shell_settings(|s| s.download_dir = None) {
                                 Ok(()) => {
-                                    if let Ok(mut slot) = shell_settings().lock() {
-                                        *slot = settings;
-                                    }
                                     eprintln!("[browser] download dir cleared to default");
                                     json_response(
                                         &mut stream,
@@ -1511,7 +2040,7 @@ fn serve_control(
                                 Err(e) => json_response(
                                     &mut stream,
                                     500,
-                                    &serde_json::json!({"error": e.to_string()}).to_string(),
+                                    &serde_json::json!({"error": e}).to_string(),
                                 ),
                             }
                             return;
@@ -1531,25 +2060,8 @@ fn serve_control(
                             );
                         } else {
                             let saved = candidate.display().to_string();
-                            let settings = ShellSettings {
-                                download_dir: Some(saved.clone()),
-                            };
-                            let persisted = settings_path()
-                                .parent()
-                                .map(std::fs::create_dir_all)
-                                .unwrap_or(Ok(()))
-                                .and_then(|()| {
-                                    std::fs::write(
-                                        settings_path(),
-                                        serde_json::to_string_pretty(&settings)
-                                            .unwrap_or_default(),
-                                    )
-                                });
-                            match persisted {
+                            match update_shell_settings(|s| s.download_dir = Some(saved.clone())) {
                                 Ok(()) => {
-                                    if let Ok(mut slot) = shell_settings().lock() {
-                                        *slot = settings;
-                                    }
                                     eprintln!("[browser] download dir set {saved}");
                                     json_response(
                                         &mut stream,
@@ -1739,8 +2251,79 @@ fn serve_control(
     }
 }
 
+/// Setup window: shellbar view full-client on `GET /setup`, no child, no
+/// DSH views. Control plane still serves (same routes); resize keeps the
+/// card full-bleed via the setup branch in `layout_shell`.
+fn run_setup_window(frame_port: u16) {
+    eprintln!("[setup] entering first-run setup (no usable backend)");
+    let last_rect = Arc::new(Mutex::new(PanelRect::default()));
+    let rect_for_setup = last_rect.clone();
+    let ids = Arc::new(Mutex::new(ShellIds {
+        dsh_port: 0,
+        frame_port,
+        frame_base: format!("http://127.0.0.1:{frame_port}"),
+    }));
+    let ids_for_setup = ids.clone();
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(DshChild(Mutex::new(None)))
+        .setup(move |app| {
+            let window = tauri::window::WindowBuilder::new(app, "main")
+                .title("dsh-desktop setup")
+                .decorations(false)
+                .inner_size(900.0, 700.0)
+                .build()?;
+            let scale = window.scale_factor().unwrap_or(1.0).max(0.01);
+            let phys = window.inner_size()?;
+            let win_w = phys.width as f64 / scale;
+            let win_h = phys.height as f64 / scale;
+            let setup_url: url::Url = format!("http://{CONTROL_ADDR}/setup")
+                .parse()
+                .map_err(|e| format!("setup URL failed: {e}"))?;
+            let bar_view = window.add_child(
+                WebviewBuilder::new("shellbar", WebviewUrl::External(setup_url)),
+                LogicalPosition::new(0.0, 0.0),
+                LogicalSize::new(win_w, win_h),
+            )?;
+            bar_view.show()?;
+            eprintln!("[setup] setup card shown");
+            let handle = app.handle().clone();
+            std::thread::spawn(move || serve_control(handle, rect_for_setup, ids_for_setup));
+            Ok(())
+        })
+        .on_window_event({
+            let rect_for_resize = last_rect.clone();
+            move |window, event| {
+                match event {
+                    tauri::WindowEvent::CloseRequested { .. }
+                    | tauri::WindowEvent::Destroyed => {
+                        kill_child(&window.state::<DshChild>().0);
+                    }
+                    tauri::WindowEvent::Resized(size) => {
+                        layout_shell(window, *size, &rect_for_resize);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .run(tauri::generate_context!())
+        .expect("tauri runtime failed");
+}
+
 fn main() {
     let frame_port = shell_frame_port();
+    // Dev override always boots straight through; otherwise a setup flag
+    // (menu → Backend…) or no usable backend at all enters setup mode.
+    let env_dev = std::env::var("DSH_BIN")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let (spawn_opt, _) = dsh_bin();
+    let flag = setup_flag_path().is_some_and(|p| p.is_file());
+    SETUP_MODE.store(!env_dev && (flag || spawn_opt.is_none()), std::sync::atomic::Ordering::Relaxed);
+    if setup_mode() {
+        run_setup_window(frame_port);
+        return;
+    }
     let (child, url, dsh_port) = match spawn_dsh(frame_port) {
         Ok(triple) => triple,
         Err(message) => {

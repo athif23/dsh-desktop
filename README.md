@@ -31,9 +31,23 @@ plane at `http://127.0.0.1:45331`.
 
 Backend resolution order (first hit wins, logged at boot as
 `dsh backend: <bin> (<source>)`): `DSH_BIN` env (dev against a live
-checkout) → installer-packaged backend
-(`%LOCALAPPDATA%\dsh-desktop\dsh-src\dsh-packaged.cmd`) → sibling
-`dsh.cmd` next to the exe → `dsh` on PATH.
+checkout) → settings custom dir (user's own checkout, launched as
+`node --import tsx/esm apps/cli/src/bin.ts` with cwd) → installer-packaged
+backend (`%LOCALAPPDATA%\dsh-desktop\dsh-src\dsh-packaged.cmd`) → sibling
+`dsh.cmd` next to the exe → `dsh` on PATH → nothing (first-run setup).
+
+## First-run setup
+
+With no usable backend (and no `DSH_BIN`) the shell boots shell-owned:
+the shellbar view goes full-window with a choice card (no DSH page
+exists yet). **Install bundled** provisions upstream (clone → manifest +
+launcher + updater → `pnpm install` → `pnpm run build`, all with polled
+progress and a heartbeat; a failed attempt wipes itself so retry heals;
+success relaunches into normal boot). **Use my own** takes a folder,
+validates installed + built, saves it to settings, and relaunches onto
+it. An unfinished packaged tree or a broken custom dir also lands here
+with the exact reason instead of a dead exit. Settings → **Backend…**
+reopens the card anytime (Cancel returns when a backend exists).
 
 ## Packaged backend + Upgrade dsh
 

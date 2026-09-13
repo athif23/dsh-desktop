@@ -61,3 +61,30 @@ pub fn updater_file(dir: &std::path::Path) -> PathBuf {
 pub fn dev_shim_file(exe_dir: &std::path::Path) -> PathBuf {
     exe_dir.join(format!("dsh.{}", script_ext()))
 }
+
+/// Fast PATH probe (no execution): is `name` resolvable right now?
+/// Used to tell "a PATH backend exists" from "nothing installed", so
+/// first-run setup only appears when there is genuinely nothing to boot.
+pub fn find_on_path(name: &str) -> Option<PathBuf> {
+    find_on_path_all(name).into_iter().next()
+}
+
+/// Every `where`/`which` hit, in order. Spawning needs a directly
+/// executable image: `where pnpm` also lists the extensionless Node
+/// entry script, which CreateProcess rejects (os error 193).
+pub fn find_on_path_all(name: &str) -> Vec<PathBuf> {
+    // Port: windows → `where`; POSIX → `which`.
+    std::process::Command::new("where")
+        .arg(name)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| PathBuf::from(l.trim()))
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
