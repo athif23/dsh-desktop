@@ -21,9 +21,12 @@ jobs:
         with:
           shared-key: release
       - name: Ensure NSIS
+        # choco installs NSIS but the PATH refresh needs a new session, so
+        # always verify via the canonical full path instead of the shell PATH.
         run: |
-          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) { choco install nsis -y }
-          makensis -VERSION
+          $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $nsis)) { choco install nsis -y }
+          & $nsis -VERSION
       - name: Install Tauri CLI
         run: cargo install tauri-cli --locked
       - name: Build installer
