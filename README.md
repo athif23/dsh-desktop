@@ -72,6 +72,16 @@ failure), relaunches the shell exe, and leaves `update-status.json`; the
 next boot toasts the verdict once and consumes the file. Refused outside
 the packaged backend — a dev checkout updates with plain git.
 
+Browser/backend skew: at boot the shell probes the running backend's
+`--version` and compares it against the staged dsh-browser copy's
+`package.json` `dsh.engines.backend` range (`>=0.1.5-rc.1` — the release
+that introduced the tab system). Match → `Backend: packaged · <v> ✓` in
+the Settings menu, silent. Mismatch → the same label names the gap plus
+one warning toast (`Browser tab unavailable… Chat is unaffected`), and
+the app runs on without the tab. Custom (non-packaged) backends are
+self-managed: labeled with their source, never judged, never touched —
+the updater refuses anything but the packaged dir.
+
 The shell pins its child's frame server (`DSH_BROWSER_FRAME_PORT`, default
 9453) and answers panel discovery at `GET /panel-config?dshPort=` with
 identity, so every Browser tab uses its own frame server and rect reports

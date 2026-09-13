@@ -342,6 +342,140 @@ fn packaged_backend_ready(dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Home of the staged dsh-browser copy the shell reads compatibility
+/// metadata from (its `package.json` `dsh.engines.backend` range). Staged
+/// beside the backend at provision time; refreshed on shell releases.
+fn bundled_browser_dir() -> Option<std::path::PathBuf> {
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|base| std::path::Path::new(&base).join("dsh-desktop").join("dsh-browser"))
+}
+
+/// Last browser/backend compatibility verdict, shown in the Settings menu.
+/// Starts as "checking…" until the background probe finishes.
+static COMPAT_LABEL: std::sync::LazyLock<std::sync::Mutex<String>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new("Backend: checking…".to_string()));
+
+fn compat_label() -> String {
+    COMPAT_LABEL.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+fn parse_semver(s: &str) -> Option<(u64, u64, u64, Option<String>)> {
+    let s = s.trim().strip_prefix('v').unwrap_or(s.trim());
+    let (nums, pre) = match s.split_once('-') {
+        Some((n, p)) => (n, Some(p.to_string())),
+        None => (s, None),
+    };
+    let mut it = nums.split('.');
+    let parts = (it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+    if it.next().is_some() {
+        return None;
+    }
+    Some((parts.0, parts.1, parts.2, pre))
+}
+
+fn cmp_prerelease(x: &str, y: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    let mut xi = x.split('.');
+    let mut yi = y.split('.');
+    loop {
+        match (xi.next(), yi.next()) {
+            (None, None) => return Equal,
+            (None, Some(_)) => return Less,
+            (Some(_), None) => return Greater,
+            (Some(a), Some(b)) => {
+                let ord = match (a.parse::<u64>().ok(), b.parse::<u64>().ok()) {
+                    (Some(m), Some(n)) => m.cmp(&n),
+                    (Some(_), None) => Less,
+                    (None, Some(_)) => Greater,
+                    (None, None) => a.cmp(b),
+                };
+                if ord != Equal {
+                    return ord;
+                }
+            }
+        }
+    }
+}
+
+fn cmp_semver(
+    a: &(u64, u64, u64, Option<String>),
+    b: &(u64, u64, u64, Option<String>),
+) -> std::cmp::Ordering {
+    (a.0, a.1, a.2)
+        .cmp(&(b.0, b.1, b.2))
+        .then_with(|| match (&a.3, &b.3) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (Some(x), Some(y)) => cmp_prerelease(x, y),
+        })
+}
+
+/// Requirement of the form `>=1.2.3-rc.1` against a probed version.
+/// Anything unparseable fails closed to "no verdict" (None): without a
+/// trustworthy comparison the shell stays quiet instead of warning wrongly.
+fn requirement_satisfied(requirement: &str, version: &str) -> Option<bool> {
+    let floor = requirement.trim().strip_prefix(">=")?;
+    let (want, have) = (parse_semver(floor)?, parse_semver(version)?);
+    Some(cmp_semver(&have, &want) != std::cmp::Ordering::Less)
+}
+
+/// Probe `<dir>`'s CLI for its version (`--version` prints it bare).
+/// Runs on a background thread; a hung node only stalls the label.
+fn backend_version(dir: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("node")
+        .arg("--import")
+        .arg("tsx/esm")
+        .args(["apps/cli/src/bin.ts", "--version"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let token = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()?
+        .trim()
+        .trim_start_matches('v')
+        .to_string();
+    if parse_semver(&token).is_some() {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+/// Compare the running backend against the staged dsh-browser's tested
+/// range. Custom (non-packaged) backends are self-managed: labeled, never
+/// judged, never touched. Returns the menu label plus an optional
+/// (backend version, requirement) mismatch pair.
+fn check_browser_compat() -> (String, Option<(String, String)>) {
+    let (_, source) = dsh_bin();
+    if source != "packaged backend" {
+        return (format!("Backend: {source} (self-managed)"), None);
+    }
+    let requirement = bundled_browser_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("package.json")).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.pointer("/dsh/engines/backend").and_then(|r| r.as_str()).map(str::to_string));
+    let (Some(requirement), Some(dir)) = (requirement, packaged_dir()) else {
+        return ("Backend: packaged · compatibility unknown".to_string(), None);
+    };
+    match backend_version(&dir) {
+        Some(version) => match requirement_satisfied(&requirement, &version) {
+            Some(true) => (format!("Backend: packaged · {version} ✓"), None),
+            Some(false) => (
+                format!("Backend: packaged · {version} — browser needs {requirement}"),
+                Some((version, requirement)),
+            ),
+            None => ("Backend: packaged · version unknown".to_string(), None),
+        },
+        None => ("Backend: packaged · version unknown".to_string(), None),
+    }
+}
+
 /// Spawn `dsh web --no-open --port <free>` and wait (bounded) for the
 /// authenticated server URL on its stdout. A wedged silent child is killed
 /// instead of hanging the shell forever.
@@ -580,6 +714,7 @@ fn show_download_toast(view: &Webview<Wry>, ok: bool, path: &std::path::Path) {
 /// backdrop closes it on outside click. Same injected-DOM channel as the
 /// download toast.
 fn settings_menu_js() -> String {
+    let backend_label = compat_label();
     format!(
         "(function(){{var o=document.getElementById('dsh-shell-menu');if(o){{closeMenu();return}}\
         var base='http://{CONTROL_ADDR}';\
@@ -598,6 +733,7 @@ fn settings_menu_js() -> String {
         inp.style.cssText='flex:1;min-width:0;background:#0d0d0d;color:#eee;border:1px solid #4a4a4a;border-radius:6px;padding:5px 8px;font-size:12px;font-family:inherit';\
         var ch=document.createElement('button');ch.textContent='Change';ch.style.cssText='background:#2d2d2d;color:#eee;border:1px solid #4a4a4a;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;font-family:inherit;white-space:nowrap';\
         frow.appendChild(inp);frow.appendChild(ch);m.appendChild(frow);\
+        var blab=document.createElement('div');blab.textContent='{backend_label}';blab.style.cssText='padding:3px 10px 10px;color:#9a9a9a;font-size:11px;white-space:nowrap';m.appendChild(blab);\
         item('Reload').onclick=function(){{post('/dsh-reload',{{}})}};\
         var sep=document.createElement('div');sep.style.cssText='border-top:1px solid #2e2e2e;margin:4px 6px';m.appendChild(sep);\
         item('Restart').onclick=function(){{if(!confirm('Restart the DSH web server? The UI reloads in a few seconds.'))return;closeMenu();\
@@ -1709,6 +1845,28 @@ fn main() {
                 for _ in 0..4 {
                     std::thread::sleep(std::time::Duration::from_secs(8));
                     show_note_toast(&toast_app, &title, &body, ok);
+                }
+            });
+            // Browser/backend compatibility probe: version the running
+            // backend against the staged dsh-browser's tested range, cache
+            // the verdict for the Settings label, and warn (never refuse)
+            // on mismatch. Custom backends are self-managed: labeled only.
+            let compat_app = app.handle().clone();
+            std::thread::spawn(move || {
+                let (label, mismatch) = check_browser_compat();
+                eprintln!("[browser] compat: {label}");
+                if let Ok(mut slot) = COMPAT_LABEL.lock() {
+                    *slot = label;
+                }
+                if let Some((version, requirement)) = mismatch {
+                    let title = "Browser tab unavailable".to_string();
+                    let body = format!(
+                        "Backend {version} is outside dsh-browser's tested range (needs {requirement}). Chat is unaffected."
+                    );
+                    for _ in 0..3 {
+                        std::thread::sleep(std::time::Duration::from_secs(8));
+                        show_note_toast(&compat_app, &title, &body, false);
+                    }
                 }
             });
             Ok(())
