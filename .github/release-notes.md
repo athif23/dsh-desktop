@@ -1,6 +1,3 @@
-<!-- Update this file before tagging a release: shell version (tag),
-     tested backend commit, and bundled dsh-browser version. -->
-
 ## Release triplet
 
 - **shell:** 0.1.0

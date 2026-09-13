@@ -2,7 +2,8 @@ name: release
 
 # Tag a shell version (v0.1.0 ↔ tauri.conf.json version) to ship:
 #   git tag v0.1.0 && git push origin v0.1.0
-# Update .github/release-notes.md first (backend/browser triplet below).
+# Before tagging, update .github/release-notes.md (shell/backend/browser
+# triplet); it is published verbatim, so keep it free of HTML comments.
 
 on:
   push:
