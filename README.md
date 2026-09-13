@@ -22,6 +22,12 @@ launch shows a choice card:
 
 Settings → **Backend…** reopens the card anytime.
 
+Choosing an option collapses the card into a progress view (log
+auto-opens, collapsible via Show details; Cancel stops the work and
+lets you re-pick — residue wipes itself on retry). An unfinished
+packaged tree or a broken custom dir also lands here with the exact
+reason instead of a dead exit.
+
 ## How it works
 
 One native window, three WebViews, explicit bounds everywhere (no
@@ -123,6 +129,8 @@ the macOS/Linux port touches this file plus script twins),
 `packaging/` (reproducible backend provisioning: install script, updater
 template, porting notes), `experiment/` (throwaway drive scripts, not
 part of the product), `dsh.cmd` (dev-only shim, never shipped).
+Debug builds log to a console; release builds are GUI-subsystem (no
+console — all tool spawns equally suppress it).
 
 Releases: tag `vX.Y.Z` (matches `tauri.conf.json`) → CI builds the
 NSIS installer on a Windows runner → published GitHub release with the

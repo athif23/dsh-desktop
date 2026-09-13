@@ -1,3 +1,4 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //! dsh-desktop: boring Tauri v2 shell around upstream `dsh web`.
 //!
 //! EXPERIMENT (multi-WebView native browser feel):
@@ -183,7 +184,7 @@ fn packaged_manifest() -> Option<PackagedManifest> {
 
 /// Run git in a directory, returning trimmed stdout or trimmed stderr.
 fn git_out(dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    let out = std::process::Command::new("git")
+    let out = platform::silent_command("git")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -253,7 +254,7 @@ fn check_backend_update() -> serde_json::Value {
     }
     // Remote already inside our history means local commits on top: diverged,
     // the updater's ff-only merge would refuse, so say so now.
-    let ancestor = std::process::Command::new("git")
+    let ancestor = platform::silent_command("git")
         .arg("-C")
         .arg(&dir)
         .args(["merge-base", "--is-ancestor", &remote, "HEAD"])
@@ -477,7 +478,7 @@ fn requirement_satisfied(requirement: &str, version: &str) -> Option<bool> {
 /// Probe `<dir>`'s CLI for its version (`--version` prints it bare).
 /// Runs on a background thread; a hung node only stalls the label.
 fn backend_version(dir: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("node")
+    let out = platform::silent_command("node")
         .arg("--import")
         .arg("tsx/esm")
         .args(["apps/cli/src/bin.ts", "--version"])
@@ -570,10 +571,30 @@ struct ProvisionState {
 static PROVISION: std::sync::LazyLock<Mutex<ProvisionState>> =
     std::sync::LazyLock::new(|| Mutex::new(ProvisionState::default()));
 
+/// Cancellation: the card's Cancel button sets the flag and kills the
+/// running step (tracked below); the worker unwinds at the next check.
+static PROVISION_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Provision generation: the heartbeat belongs to the run that spawned
+/// it, so a cancelled run's heartbeat can't chatter into the next run.
+static PROVISION_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The currently running provision step, if any (killable on cancel).
+static PROVISION_CHILD: std::sync::LazyLock<Mutex<Option<Child>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
 fn prov_log(line: String) {
     let line = line.chars().take(300).collect::<String>();
     eprintln!("[setup] {line}");
     if let Ok(mut s) = PROVISION.lock() {
+        // Collapse git's carriage-return progress spam in the card: one
+        // live line instead of hundreds.
+        if line.contains("Updating files:") {
+            if let Some(last) = s.log.last_mut() {
+                if last.contains("Updating files:") {
+                    *last = line;
+                    return;
+                }
+            }
+        }
         s.log.push(line);
         if s.log.len() > 60 {
             let drop = s.log.len() - 60;
@@ -589,24 +610,73 @@ fn prov_phase(phase: &str) {
     }
 }
 
-/// One provision step: run, keep the tail in the card log, fail loud.
+/// One provision step: run with a live card log, killable on cancel.
+/// Pipes drain on threads (a chatty child can never block), the handle is
+/// tracked for Cancel, and the wait loop polls the cancel flag.
 fn run_step(dir: &std::path::Path, prog: &std::path::Path, args: &[&str], phase: &str) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
     prov_phase(phase);
-    let out = std::process::Command::new(prog)
+    if PROVISION_CANCEL.load(Ordering::Relaxed) {
+        return Err("Cancelled.".to_string());
+    }
+    let mut child = platform::silent_command(prog)
         .args(args)
         .current_dir(dir)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("could not start {}: {e}", prog.display()))?;
-    let combined = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let tail: Vec<&str> = combined.lines().filter(|l| !l.trim().is_empty()).collect();
-    for line in tail.iter().rev().take(4).rev() {
-        prov_log(format!("| {line}"));
+    // Live log: drain both pipes on threads straight into the card.
+    if let Some(pipe) = child.stdout.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    prov_log(format!("| {trimmed}"));
+                }
+            }
+        });
     }
-    if !out.status.success() {
+    if let Some(pipe) = child.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    prov_log(format!("| {trimmed}"));
+                }
+            }
+        });
+    }
+    if let Ok(mut slot) = PROVISION_CHILD.lock() {
+        *slot = Some(child);
+    }
+    let status = loop {
+        let done = if let Ok(mut slot) = PROVISION_CHILD.lock() {
+            match slot.as_mut() {
+                Some(child) => child.try_wait().map_err(|e| e.to_string())?,
+                None => return Err("Cancelled.".to_string()),
+            }
+        } else {
+            return Err("provision state locked".to_string());
+        };
+        if let Some(status) = done {
+            break status;
+        }
+        if PROVISION_CANCEL.load(Ordering::Relaxed) {
+            if let Ok(mut slot) = PROVISION_CHILD.lock() {
+                if let Some(mut child) = slot.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+            return Err("Cancelled.".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if let Ok(mut slot) = PROVISION_CHILD.lock() {
+        slot.take();
+    }
+    if !status.success() {
         return Err(format!("{} {} failed", prog.display(), args.join(" ")));
     }
     Ok(())
@@ -628,15 +698,26 @@ fn resolve_tool(name: &str, why: &str) -> Result<std::path::PathBuf, String> {
 }
 
 fn provision_bundled() {
+    use std::sync::atomic::Ordering;
     if PROVISION.lock().map(|s| !s.phase.is_empty() && !s.done).unwrap_or(false) {
         return;
     }
-    std::thread::spawn(|| {
+    PROVISION_GEN.fetch_add(1, Ordering::Relaxed);
+    PROVISION_CANCEL.store(false, Ordering::Relaxed);
+    if let Ok(mut s) = PROVISION.lock() {
+        *s = ProvisionState::default();
+    }
+    let gen = PROVISION_GEN.load(Ordering::Relaxed);
+    std::thread::spawn(move || {
         let started = std::time::Instant::now();
         // Heartbeat: install/build are minute-scale silences otherwise.
+        // Generation-bound so a cancelled run goes quiet immediately.
         std::thread::spawn(move || {
             for _ in 0..40 {
                 std::thread::sleep(std::time::Duration::from_secs(30));
+                if PROVISION_GEN.load(Ordering::Relaxed) != gen {
+                    return;
+                }
                 let finished = PROVISION.lock().map(|s| s.done).unwrap_or(true);
                 if finished {
                     return;
@@ -645,6 +726,11 @@ fn provision_bundled() {
             }
         });
         let result = provision_bundled_inner();
+        // Cancelled: the cancel route already reset the card; stay silent.
+        if PROVISION_CANCEL.load(Ordering::Relaxed) {
+            PROVISION_CANCEL.store(false, Ordering::Relaxed);
+            return;
+        }
         if let Ok(mut s) = PROVISION.lock() {
             s.done = true;
             match &result {
@@ -720,7 +806,7 @@ fn provision_bundled_inner() -> Result<String, String> {
 /// needs its own detach here (see `platform`).
 fn relaunch_self() {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new("cmd")
+        let _ = platform::silent_command("cmd")
             .args(["/C", "start", "", &exe.to_string_lossy()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -797,9 +883,11 @@ button:disabled{opacity:.5;cursor:default}
 </style></head><body>
 <div id=head><span id=brand>dsh-desktop setup</span><span id=wins><button class=winbtn id=min>─</button><button class=winbtn id=max>▢</button><button class=winbtn id=cls>✕</button></span></div>
 <div id=card><h1>Choose your dsh backend</h1><div id=state></div>
+<div id=choices>
 <button class=opt id=b-bundled>Install bundled dsh (recommended)<small>Clones upstream, installs, builds. Updates arrive via Settings → Upgrade dsh.</small></button>
 <button class=opt id=b-custom>Use my own dsh<small>You update it yourself with plain git. The shell never touches it.</small></button>
 <div id=cpath><input id=pin readonly placeholder="No folder chosen yet"><div class=row><button id=browse>Browse…</button><button id=use>Use this folder</button></div></div>
+</div>
 <div id=details><div id=phase></div><button id=toggle>Show details<svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 3.5 5 6.5 8 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button><div id=log></div></div>
 <div id=foot><button id=cancel>Cancel</button></div>
 </div><script>
@@ -815,25 +903,28 @@ head.addEventListener('mousemove',function(e){if(!dp)return;if(Math.abs(e.client
 head.addEventListener('mouseup',function(){dp=null});
 var phase=document.getElementById('phase'),log=document.getElementById('log'),state=document.getElementById('state');
 var cpath=document.getElementById('cpath'),pin=document.getElementById('pin');
-var details=document.getElementById('details'),toggle=document.getElementById('toggle'),cancelBtn=document.getElementById('cancel');
+var details=document.getElementById('details'),toggle=document.getElementById('toggle');
 var busy=false;
 function revealDetails(){details.style.display='block'}
-function setBusy(b){busy=b;cancelBtn.disabled=b}
-toggle.onclick=function(){var open=log.style.display==='block';log.style.display=open?'none':'block';toggle.classList.toggle('open',!open);toggle.childNodes[0].textContent=!open?'Hide details':'Show details'};
+function openLog(o){log.style.display=o?'block':'none';toggle.classList.toggle('open',o);toggle.childNodes[0].textContent=o?'Hide details':'Show details'}
+function setBusy(b){busy=b}
+function enterWorking(t){document.getElementById('choices').style.display='none';revealDetails();openLog(true);phase.textContent=t}
+function exitWorking(){document.getElementById('choices').style.display='block'}
+toggle.onclick=function(){openLog(log.style.display!=='block')};
 document.getElementById('b-bundled').onclick=function(){
-if(busy)return;setBusy(true);revealDetails();phase.textContent='Starting…';
+if(busy)return;setBusy(true);enterWorking('Starting…');
 post('/setup-start',{kind:'bundled'}).then(function(r){if(r.error){setBusy(false);phase.textContent='Failed: '+r.error}}).catch(function(){setBusy(false);phase.textContent='Shell unreachable'})};
 document.getElementById('b-custom').onclick=function(){cpath.style.display='block'};
 document.getElementById('browse').onclick=function(){post('/setup-pick',{}).then(function(r){if(r.path)pin.value=r.path})};
 document.getElementById('use').onclick=function(){
-if(busy||!pin.value)return;setBusy(true);revealDetails();phase.textContent='Validating…';
+if(busy||!pin.value)return;setBusy(true);enterWorking('Validating…');
 post('/setup-start',{kind:'custom',path:pin.value}).then(function(r){if(r.error){setBusy(false);phase.textContent='Not usable: '+r.error}else{phase.textContent='Accepted — relaunching…'}}).catch(function(){setBusy(false);phase.textContent='Shell unreachable'})};
-document.getElementById('cancel').onclick=function(){if(busy)return;post('/setup-cancel',{})};
+document.getElementById('cancel').onclick=function(){post('/setup-cancel',{}).then(function(r){if(r&&r.cancelled){setBusy(false);exitWorking();phase.textContent='Cancelled.'}else{phase.textContent='Leaving…'}}).catch(function(){})};
 setInterval(function(){fetch(base+'/setup-status').then(function(r){return r.json()}).then(function(s){
 state.textContent=s.state||'';if(s.phase){revealDetails();phase.textContent=s.phase}
 if(s.log)log.textContent=s.log.join('\n');
 if(s.done&&!s.error)phase.textContent=s.phase+' — relaunching…';
-if(s.done&&s.error){setBusy(false);phase.textContent='Failed: '+s.error}}).catch(function(){})},1000);
+if(s.done&&s.error){setBusy(false);exitWorking();phase.textContent='Failed: '+s.error}}).catch(function(){})},1000);
 })();
 </script></body></html>"#;
     PAGE.replace("__BASE__", &format!("http://{CONTROL_ADDR}"))
@@ -850,14 +941,14 @@ fn spawn_dsh(frame_port: u16) -> Result<(Child, String, u16), String> {
     // with cwd; everything else spawns its launcher with argv.
     let (mut cmd, label) = match spawn {
         Some(BackendSpawn::Bin(bin)) => {
-            let mut c = Command::new(&bin);
+            let mut c = platform::silent_command(&bin);
             c.args(["web", "--no-open", "--port", &port.to_string()]);
             (c, bin)
         }
         Some(BackendSpawn::NodeDir(dir)) => {
             let label = dir.display().to_string();
             packaged_backend_ready(&dir, false)?;
-            let mut c = Command::new("node");
+            let mut c = platform::silent_command("node");
             c.arg("--import")
                 .arg("tsx/esm")
                 .args(["apps/cli/src/bin.ts", "web", "--no-open", "--port", &port.to_string()])
@@ -1600,9 +1691,17 @@ fn serve_control(
                         .unwrap_or_default();
                     let tail: Vec<String> =
                         log.into_iter().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect();
+                    // While work runs, the state line names the work — not
+                    // the half-written tree (which would read "unfinished").
+                    let working = !phase.is_empty() && !done;
+                    let state = if working {
+                        "Setting up your backend…".to_string()
+                    } else {
+                        setup_state_text()
+                    };
                     let out = serde_json::json!({
                         "phase": phase, "log": tail, "done": done,
-                        "error": error, "state": setup_state_text(),
+                        "error": error, "state": state,
                     });
                     json_response(&mut stream, 200, &out.to_string());
                 }
@@ -1687,6 +1786,26 @@ fn serve_control(
                     ),
                 },
                 "POST /setup-cancel" => {
+                    // Busy means the card's Cancel is really "stop the
+                    // work": kill the step, reset the card, stay put.
+                    let working = PROVISION
+                        .lock()
+                        .map(|s| !s.phase.is_empty() && !s.done)
+                        .unwrap_or(false);
+                    if working {
+                        PROVISION_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if let Ok(mut slot) = PROVISION_CHILD.lock() {
+                            if let Some(mut child) = slot.take() {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                            }
+                        }
+                        if let Ok(mut s) = PROVISION.lock() {
+                            *s = ProvisionState::default();
+                        }
+                        json_response(&mut stream, 200, r#"{"ok":true,"cancelled":true}"#);
+                        return;
+                    }
                     if let Some(flag) = setup_flag_path() {
                         let _ = std::fs::remove_file(flag);
                     }
@@ -2167,7 +2286,7 @@ fn serve_control(
                         return;
                     }
                     eprintln!("[browser] dsh upgrade accepted: {} -> {} ({}), relaunching via updater", manifest.branch, manifest.remote, dir.display());
-                    let spawn_out = std::process::Command::new("cmd")
+                    let spawn_out = platform::silent_command("cmd")
                         .args(["/C", "start", "/min", "", &updater.to_string_lossy(), &dir.to_string_lossy(), &remote_name, &manifest.branch, &shell_exe])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())

@@ -57,6 +57,20 @@ pub fn updater_file(dir: &std::path::Path) -> PathBuf {
     dir.join(format!("updater.{}", script_ext()))
 }
 
+/// Spawn a console tool without ever flashing a console window.
+/// Release builds are `windows_subsystem` GUI apps; without this flag
+/// every git/node/pnpm/cmd child would pop its own console. Stdio pipes
+/// keep working — only the visible window is suppressed.
+pub fn silent_command<S: AsRef<std::ffi::OsStr>>(prog: S) -> std::process::Command {
+    let mut cmd = std::process::Command::new(prog);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    cmd
+}
+
 /// Dev-only shim sitting next to the shell exe (never shipped).
 pub fn dev_shim_file(exe_dir: &std::path::Path) -> PathBuf {
     exe_dir.join(format!("dsh.{}", script_ext()))
@@ -74,7 +88,7 @@ pub fn find_on_path(name: &str) -> Option<PathBuf> {
 /// entry script, which CreateProcess rejects (os error 193).
 pub fn find_on_path_all(name: &str) -> Vec<PathBuf> {
     // Port: windows → `where`; POSIX → `which`.
-    std::process::Command::new("where")
+    silent_command("where")
         .arg(name)
         .output()
         .ok()
