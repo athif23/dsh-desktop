@@ -11,7 +11,9 @@ plugin.
 
 Download `dsh-desktop_*_x64-setup.exe` from
 [Releases](https://github.com/athif23/dsh-desktop/releases) and run it
-(per-user, no admin). First launch shows a choice card:
+(per-user, no admin). Requires Git, Node.js 22+, and pnpm on PATH
+(first-run provisioning and backend updates shell out to them). First
+launch shows a choice card:
 
 - **Install bundled dsh** (recommended) — clones upstream, installs,
   builds. Later updates arrive via Settings → Upgrade dsh.
