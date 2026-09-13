@@ -1,0 +1,34 @@
+name: release
+
+# Tag a shell version (v0.1.0 ↔ tauri.conf.json version) to ship:
+#   git tag v0.1.0 && git push origin v0.1.0
+# Update .github/release-notes.md first (backend/browser triplet below).
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+      - name: Ensure NSIS
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) { choco install nsis -y }
+          makensis -VERSION
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+      - name: Build installer
+        run: cargo tauri build
+      - name: Publish GitHub release
+        run: gh release create "${{ github.ref_name }}" --title "dsh-desktop ${{ github.ref_name }}" --notes-file .github/release-notes.md target/release/bundle/nsis/*-setup.exe
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
