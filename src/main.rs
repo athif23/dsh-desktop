@@ -566,6 +566,7 @@ struct ProvisionState {
     log: Vec<String>,
     done: bool,
     error: Option<String>,
+    cancelled: bool,
 }
 
 static PROVISION: std::sync::LazyLock<Mutex<ProvisionState>> =
@@ -905,6 +906,7 @@ var phase=document.getElementById('phase'),log=document.getElementById('log'),st
 var cpath=document.getElementById('cpath'),pin=document.getElementById('pin');
 var details=document.getElementById('details'),toggle=document.getElementById('toggle');
 var busy=false;
+var wasWorking=false;
 function revealDetails(){details.style.display='block'}
 function openLog(o){log.style.display=o?'block':'none';toggle.classList.toggle('open',o);toggle.childNodes[0].textContent=o?'Hide details':'Show details'}
 function setBusy(b){busy=b}
@@ -913,18 +915,24 @@ function exitWorking(){document.getElementById('choices').style.display='block'}
 toggle.onclick=function(){openLog(log.style.display!=='block')};
 document.getElementById('b-bundled').onclick=function(){
 if(busy)return;setBusy(true);enterWorking('Starting…');
-post('/setup-start',{kind:'bundled'}).then(function(r){if(r.error){setBusy(false);phase.textContent='Failed: '+r.error}}).catch(function(){setBusy(false);phase.textContent='Shell unreachable'})};
+post('/setup-start',{kind:'bundled'}).then(function(r){if(r.error){setBusy(false);exitWorking();phase.textContent='Failed: '+r.error}}).catch(function(){setBusy(false);exitWorking();phase.textContent='Shell unreachable'})};
 document.getElementById('b-custom').onclick=function(){cpath.style.display='block'};
 document.getElementById('browse').onclick=function(){post('/setup-pick',{}).then(function(r){if(r.path)pin.value=r.path})};
 document.getElementById('use').onclick=function(){
 if(busy||!pin.value)return;setBusy(true);enterWorking('Validating…');
-post('/setup-start',{kind:'custom',path:pin.value}).then(function(r){if(r.error){setBusy(false);phase.textContent='Not usable: '+r.error}else{phase.textContent='Accepted — relaunching…'}}).catch(function(){setBusy(false);phase.textContent='Shell unreachable'})};
+post('/setup-start',{kind:'custom',path:pin.value}).then(function(r){if(r.error){setBusy(false);exitWorking();phase.textContent='Not usable: '+r.error}else{phase.textContent='Accepted — relaunching…'}}).catch(function(){setBusy(false);exitWorking();phase.textContent='Shell unreachable'})};
 document.getElementById('cancel').onclick=function(){post('/setup-cancel',{}).then(function(r){if(r&&r.cancelled){setBusy(false);exitWorking();phase.textContent='Cancelled.'}else{phase.textContent='Leaving…'}}).catch(function(){})};
 setInterval(function(){fetch(base+'/setup-status').then(function(r){return r.json()}).then(function(s){
-state.textContent=s.state||'';if(s.phase){revealDetails();phase.textContent=s.phase}
+state.textContent=s.state||'';
+var working=!!(s.phase&&!s.done);
+if(!s.done){document.getElementById('choices').style.display=working?'none':'block'}
+if(working){revealDetails();if(!wasWorking)openLog(true)}
+wasWorking=working;
+if(s.phase)phase.textContent=s.phase;
 if(s.log)log.textContent=s.log.join('\n');
-if(s.done&&!s.error)phase.textContent=s.phase+' — relaunching…';
-if(s.done&&s.error){setBusy(false);exitWorking();phase.textContent='Failed: '+s.error}}).catch(function(){})},1000);
+if(s.cancelled){setBusy(false);exitWorking();phase.textContent='Cancelled.'}
+else if(s.done&&!s.error)phase.textContent=s.phase+' — relaunching…';
+else if(s.done&&s.error){setBusy(false);exitWorking();phase.textContent='Failed: '+s.error}}).catch(function(){})},1000);
 })();
 </script></body></html>"#;
     PAGE.replace("__BASE__", &format!("http://{CONTROL_ADDR}"))
@@ -1685,9 +1693,9 @@ fn serve_control(
                 // no DSH page exists yet, so all of this is shell-owned).
                 "GET /setup" => html_response(&mut stream, &setup_html()),
                 "GET /setup-status" => {
-                    let (phase, log, done, error) = PROVISION
+                    let (phase, log, done, error, cancelled) = PROVISION
                         .lock()
-                        .map(|s| (s.phase.clone(), s.log.clone(), s.done, s.error.clone()))
+                        .map(|s| (s.phase.clone(), s.log.clone(), s.done, s.error.clone(), s.cancelled))
                         .unwrap_or_default();
                     let tail: Vec<String> =
                         log.into_iter().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect();
@@ -1701,7 +1709,7 @@ fn serve_control(
                     };
                     let out = serde_json::json!({
                         "phase": phase, "log": tail, "done": done,
-                        "error": error, "state": state,
+                        "error": error, "state": state, "cancelled": cancelled,
                     });
                     json_response(&mut stream, 200, &out.to_string());
                 }
@@ -1793,15 +1801,25 @@ fn serve_control(
                         .map(|s| !s.phase.is_empty() && !s.done)
                         .unwrap_or(false);
                     if working {
-                        PROVISION_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+                        use std::sync::atomic::Ordering;
+                        PROVISION_CANCEL.store(true, Ordering::Relaxed);
+                        // New generation: a heartbeat sleeping through the
+                        // cancel must not chatter into the reset card.
+                        PROVISION_GEN.fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut slot) = PROVISION_CHILD.lock() {
                             if let Some(mut child) = slot.take() {
                                 let _ = child.kill();
                                 let _ = child.wait();
                             }
                         }
+                        // Convergent terminal state (log trail kept for the
+                        // still-open details view) so every client — click
+                        // handler or raw POST — sees the same card.
                         if let Ok(mut s) = PROVISION.lock() {
-                            *s = ProvisionState::default();
+                            s.phase = "Cancelled.".to_string();
+                            s.done = true;
+                            s.error = None;
+                            s.cancelled = true;
                         }
                         json_response(&mut stream, 200, r#"{"ok":true,"cancelled":true}"#);
                         return;
