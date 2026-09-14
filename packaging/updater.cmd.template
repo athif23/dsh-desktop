@@ -8,7 +8,10 @@ set "SRC=%~1"
 set "REMOTE=%~2"
 set "BRANCH=%~3"
 set "SHELL=%~4"
-set "HOME_DSH=%LOCALAPPDATA%\dsh-desktop"
+rem State root = parent of the packaged dir (arg 1 is always <root>\dsh-src).
+rem Deriving it keeps portable trees (state beside the exe) and installed
+rem trees (%LOCALAPPDATA%) on the same script.
+for %%I in ("%~dp1..") do set "HOME_DSH=%%~fI"
 set "STATUS=%HOME_DSH%\update-status.json"
 set "LOG=%HOME_DSH%\update.log"
 if not exist "%HOME_DSH%" mkdir "%HOME_DSH%"

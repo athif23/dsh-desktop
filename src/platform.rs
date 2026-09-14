@@ -10,17 +10,59 @@
 //! - the detached-spawn contract (Windows: `cmd /C start /min`, which
 //!   outlives the parent; POSIX: double-fork/nohup or `open`, TBD by the
 //!   porter — the call site is marked)
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Marker file next to the exe that switches this binary to portable mode
+/// (shipped inside the portable zip, self-documenting). Absent = the
+/// normal per-user AppData layout, exactly as the installer leaves it.
+pub fn portable_marker_file() -> &'static str {
+    "portable.txt"
+}
+
+/// Portable root: `<exe dir>/data` when the marker file sits beside the
+/// exe, else `None`. The same binary serves both layouts — the marker is
+/// the only switch, so an installed copy and a portable copy stay
+/// byte-identical and independently testable.
+pub fn portable_root() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    dir.join(portable_marker_file())
+        .is_file()
+        .then(|| dir.join("data"))
+}
 
 /// Per-user root for shell-owned state: backend clone, staged browser
 /// copy, updater status. Per-user (never Program Files) so backend
-/// updates never need elevation.
+/// updates never need elevation; portable mode keeps it beside the exe.
 pub fn app_data_dir() -> Option<PathBuf> {
+    if let Some(root) = portable_root() {
+        return Some(root);
+    }
     // Port: windows → LOCALAPPDATA; macos → home + Library/Application
     // Support; linux → $XDG_DATA_HOME or home + .local/share.
     std::env::var("LOCALAPPDATA")
         .ok()
-        .map(|base| std::path::Path::new(&base).join("dsh-desktop"))
+        .map(|base| Path::new(&base).join("dsh-desktop"))
+}
+
+/// Directory holding the shell's own settings JSON (roaming on Windows
+/// so the backend choice follows the user profile). Portable mode keeps
+/// it with the rest of the portable state.
+pub fn settings_dir() -> Option<PathBuf> {
+    if let Some(root) = portable_root() {
+        return Some(root);
+    }
+    std::env::var("APPDATA").ok().map(|roam| Path::new(&roam).join("dsh-desktop"))
+}
+
+/// One-line description of where shell state lives, logged at boot so a
+/// support log always names the layout in effect.
+pub fn state_root_note() -> String {
+    match (portable_root(), app_data_dir()) {
+        (Some(root), _) => format!("portable — state in {}", root.display()),
+        (None, Some(root)) => format!("per-user — state in {}", root.display()),
+        (None, None) => "per-user — no state root resolved".to_string(),
+    }
 }
 
 /// Home of the installer-packaged dsh backend: pristine upstream clone

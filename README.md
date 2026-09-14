@@ -9,10 +9,17 @@ plugin.
 
 ## Install & first run
 
-Download `dsh-desktop_*_x64-setup.exe` from
-[Releases](https://github.com/athif23/dsh-desktop/releases) and run it
-(per-user, no admin). Requires Git, Node.js 22+, and pnpm on PATH
-(first-run provisioning and backend updates shell out to them). First
+Two downloads from [Releases](https://github.com/athif23/dsh-desktop/releases):
+
+- **`*_x64-setup.exe`** — installer, per-user, no admin.
+- **`*_portable_x64.zip`** — extract anywhere, run the exe, install
+  nothing. Shell-owned state goes to a `data\` folder beside the exe
+  (backend, settings, logs, WebView2 profile), so the folder is the whole
+  app and deleting it resets everything. The zip's `portable.txt` marker
+  is the switch; the exe inside is byte-identical to the installer's.
+
+Either way: Git, Node.js 22+, and pnpm on PATH (first-run provisioning
+and backend updates shell out to them) plus the WebView2 runtime. First
 launch shows a choice card:
 
 - **Install bundled dsh** (recommended) — clones upstream, installs,
@@ -22,11 +29,17 @@ launch shows a choice card:
 
 Settings → **Backend…** reopens the card anytime.
 
-Choosing an option collapses the card into a progress view (log
-auto-opens, collapsible via Show details; Cancel stops the work and
-lets you re-pick — residue wipes itself on retry). An unfinished
-packaged tree or a broken custom dir also lands here with the exact
-reason instead of a dead exit.
+Choosing an option collapses the card into a progress view: the full step
+checklist (clone → launcher → dependencies → build) with done / running /
+pending marks, a live log (auto-opens, collapsible via Show details), and
+Cancel, which stops the running step and lets you re-pick — residue wipes
+itself on retry. Picking **Install bundled dsh** when a working packaged
+backend already exists switches to it instead of re-cloning. An unfinished
+packaged tree or a broken custom dir also lands here with the exact reason
+instead of a dead exit.
+
+Portable and installed copies share the loopback control port, so run one
+at a time.
 
 ## How it works
 
@@ -59,7 +72,8 @@ remote-debugging port, no second browser process.
 Backend resolution order (first hit wins, logged at boot): `DSH_BIN`
 env (dev) → settings custom dir (launched as
 `node --import tsx/esm apps/cli/src/bin.ts` with cwd) → packaged
-backend (`%LOCALAPPDATA%\dsh-desktop\dsh-src`) → sibling `dsh.cmd` →
+backend (`<state root>\dsh-src`: `%LOCALAPPDATA%\dsh-desktop` installed,
+or `data\` beside the exe in portable mode) → sibling `dsh.cmd` →
 `dsh` on PATH → first-run setup.
 
 ## Packaged backend + Upgrade dsh

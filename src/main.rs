@@ -567,6 +567,24 @@ struct ProvisionState {
     done: bool,
     error: Option<String>,
     cancelled: bool,
+    steps: Vec<ProvisionStep>,
+}
+
+/// Ordered provision pipeline, rendered as the setup card's checklist so
+/// the user sees the whole plan and their place in it. Labels must match
+/// the `prov_phase` strings the provisioner announces.
+const PROVISION_STEPS: &[&str] = &[
+    "Cloning upstream dsh",
+    "Writing launcher + updater",
+    "Installing dependencies (pnpm install)",
+    "Building the backend (pnpm run build)",
+];
+
+#[derive(Clone, serde::Serialize)]
+struct ProvisionStep {
+    label: String,
+    /// `pending` | `active` | `done` | `failed`.
+    state: &'static str,
 }
 
 static PROVISION: std::sync::LazyLock<Mutex<ProvisionState>> =
@@ -608,6 +626,24 @@ fn prov_phase(phase: &str) {
     prov_log(format!("—— {phase}"));
     if let Ok(mut s) = PROVISION.lock() {
         s.phase = phase.to_string();
+        let Some(idx) = PROVISION_STEPS.iter().position(|p| *p == phase) else {
+            // Recovery actions outside the pipeline (clearing a failed
+            // attempt) are not checklist rows; the list stands as it is.
+            return;
+        };
+        if s.steps.is_empty() {
+            s.steps = PROVISION_STEPS
+                .iter()
+                .map(|label| ProvisionStep { label: (*label).to_string(), state: "pending" })
+                .collect();
+        }
+        for (n, step) in s.steps.iter_mut().enumerate() {
+            step.state = match n.cmp(&idx) {
+                std::cmp::Ordering::Less => "done",
+                std::cmp::Ordering::Equal => "active",
+                std::cmp::Ordering::Greater => "pending",
+            };
+        }
     }
 }
 
@@ -735,14 +771,33 @@ fn provision_bundled() {
         if let Ok(mut s) = PROVISION.lock() {
             s.done = true;
             match &result {
-                Ok(sha) => s.phase = format!("Ready ({sha}) — relaunching…"),
+                Ok(sha) => {
+                    s.phase = format!("Ready ({sha}) — relaunching…");
+                    for step in s.steps.iter_mut() {
+                        if step.state != "failed" {
+                            step.state = "done";
+                        }
+                    }
+                }
                 Err(e) => {
                     s.phase = "Failed".to_string();
                     s.error = Some(e.clone());
+                    for step in s.steps.iter_mut() {
+                        if step.state == "active" {
+                            step.state = "failed";
+                        }
+                    }
                 }
             }
         }
         if result.is_ok() {
+            // Choosing the bundled backend is a real choice: it must beat
+            // any earlier custom pick, or a fresh install would never be
+            // the backend that boots. Only on success — a failure keeps
+            // whatever the user had working.
+            if let Err(e) = update_shell_settings(|s| s.backend = None) {
+                prov_log(format!("could not record the backend choice: {e}"));
+            }
             std::thread::sleep(std::time::Duration::from_millis(800));
             relaunch_self();
         }
@@ -762,6 +817,16 @@ fn provision_bundled_inner() -> Result<String, String> {
         std::fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
     }
     if dest.join("dsh-manifest.json").is_file() {
+        // Already provisioned: "Install bundled" means "use the bundled
+        // backend", and the tree above was just proven ready. Re-cloning
+        // would be wasted work — boot on it (the caller clears any
+        // earlier custom pick so this backend actually wins).
+        if packaged_backend_ready(&dest, true).is_ok() {
+            prov_log("using the existing bundled backend".to_string());
+            return Ok(packaged_manifest()
+                .map(|m| short_sha(&m.commit))
+                .unwrap_or_default());
+        }
         return Err("already provisioned — backend updates go through Settings → Upgrade dsh".to_string());
     }
     if dest.exists() {
@@ -870,7 +935,21 @@ h1{font-size:18px;margin:0 0 6px;text-align:center}
 button{background:#2d2d2d;color:#eee;border:1px solid #4a4a4a;border-radius:6px;padding:6px 14px;font-size:12px;cursor:pointer;font-family:inherit}
 button:hover{background:#3a3a3a}
 button:disabled{opacity:.5;cursor:default}
-#phase{color:#9a9a9a;font-size:12px;margin:0 0 6px;min-height:16px}
+#phaserow{display:flex;align-items:center;gap:8px;margin:0 0 6px;min-height:16px}
+#steps{list-style:none;margin:0 0 10px;padding:0}
+#steps li{display:flex;align-items:center;gap:8px;font-size:12px;color:#7d7d7d;padding:3px 0}
+#steps li.active{color:#eaeaea}
+#steps li.failed{color:#f28b82}
+.stepmark{width:12px;height:12px;flex:0 0 12px;display:block;color:#4a4a4a}
+#steps li.active .stepmark{color:#7aa2f7;animation:spin .9s linear infinite}
+#steps li.done .stepmark{color:#5fa87a}
+#steps li.failed .stepmark{color:#f28b82}
+#spin{display:none;color:#7aa2f7}
+#phaserow.busy #spin{display:block}
+#spin svg{display:block;animation:spin .9s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){#spin svg{animation:none}}
+#phase{color:#9a9a9a;font-size:12px}
 #details{display:none;margin-top:14px}
 #toggle{background:none;border:none;color:#9a9a9a;font-size:12px;cursor:pointer;display:flex;align-items:center;gap:6px;padding:4px 0;font-family:inherit}
 #toggle:hover{color:#ccc}
@@ -889,7 +968,7 @@ button:disabled{opacity:.5;cursor:default}
 <button class=opt id=b-custom>Use my own dsh<small>You update it yourself with plain git. The shell never touches it.</small></button>
 <div id=cpath><input id=pin readonly placeholder="No folder chosen yet"><div class=row><button id=browse>Browse…</button><button id=use>Use this folder</button></div></div>
 </div>
-<div id=details><div id=phase></div><button id=toggle>Show details<svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 3.5 5 6.5 8 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button><div id=log></div></div>
+<div id=details><ul id=steps style=display:none></ul><div id=phaserow><span id=spin aria-hidden=true><svg width="12" height="12" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-dasharray="17 11"/></svg></span><div id=phase></div></div><button id=toggle>Show details<svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 3.5 5 6.5 8 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button><div id=log></div></div>
 <div id=foot><button id=cancel>Cancel</button></div>
 </div><script>
 (function(){
@@ -910,8 +989,28 @@ var wasWorking=false;
 function revealDetails(){details.style.display='block'}
 function openLog(o){log.style.display=o?'block':'none';toggle.classList.toggle('open',o);toggle.childNodes[0].textContent=o?'Hide details':'Show details'}
 function setBusy(b){busy=b}
-function enterWorking(t){document.getElementById('choices').style.display='none';revealDetails();openLog(true);phase.textContent=t}
-function exitWorking(){document.getElementById('choices').style.display='block'}
+function stepIcon(state){
+if(state==='done')return '<svg class=stepmark viewBox="0 0 12 12"><path d="M2.6 6.4 4.9 8.7 9.4 3.6" fill=none stroke=currentColor stroke-width=1.7 stroke-linecap=round stroke-linejoin=round/></svg>';
+if(state==='failed')return '<svg class=stepmark viewBox="0 0 12 12"><path d="M3.3 3.3 8.7 8.7M8.7 3.3 3.3 8.7" fill=none stroke=currentColor stroke-width=1.7 stroke-linecap=round/></svg>';
+if(state==='active')return '<svg class=stepmark viewBox="0 0 12 12"><circle cx=6 cy=6 r=4.5 fill=none stroke=currentColor stroke-width=1.6 stroke-linecap=round stroke-dasharray="17 11"/></svg>';
+return '<svg class=stepmark viewBox="0 0 12 12"><circle cx=6 cy=6 r=2.8 fill=currentColor opacity=.5/></svg>';
+}
+function renderSteps(steps,finished,errored){
+var box=document.getElementById('steps');
+if(!steps||!steps.length){box.innerHTML='';box.style.display='none';return false}
+box.style.display='block';
+box.innerHTML=steps.map(function(s){
+var state=s.state||'pending';
+// A finished run must never animate: a stale "active" row reads as if
+// work were still going after it stopped.
+if(finished&&state==='active')state=errored?'failed':'done';
+return '<li class="'+state+'">'+stepIcon(state)+'<span></span></li>'}).join('');
+var spans=box.querySelectorAll('li>span');
+for(var i=0;i<spans.length;i++)spans[i].textContent=steps[i].label;
+return true;
+}
+function enterWorking(t){document.getElementById('choices').style.display='none';document.getElementById('phaserow').classList.add('busy');revealDetails();openLog(true);phase.textContent=t}
+function exitWorking(){document.getElementById('choices').style.display='block';document.getElementById('phaserow').classList.remove('busy')}
 toggle.onclick=function(){openLog(log.style.display!=='block')};
 document.getElementById('b-bundled').onclick=function(){
 if(busy)return;setBusy(true);enterWorking('Starting…');
@@ -925,6 +1024,13 @@ document.getElementById('cancel').onclick=function(){post('/setup-cancel',{}).th
 setInterval(function(){fetch(base+'/setup-status').then(function(r){return r.json()}).then(function(s){
 state.textContent=s.state||'';
 var working=!!(s.phase&&!s.done);
+var hasSteps=renderSteps(s.steps,s.done&&!s.cancelled,!!s.error);
+// The active checklist row already names the phase; the note line is for
+// everything the list cannot express (recovery, Ready, Failed, Cancelled).
+var phaseIsStep=false;
+if(hasSteps){for(var i=0;i<s.steps.length;i++){if(s.steps[i].label===s.phase){phaseIsStep=true}}}
+document.getElementById('phaserow').style.display=(hasSteps&&phaseIsStep)?'none':'flex';
+document.getElementById('phaserow').classList.toggle('busy',working&&!hasSteps);
 if(!s.done){document.getElementById('choices').style.display=working?'none':'block'}
 if(working){revealDetails();if(!wasWorking)openLog(true)}
 wasWorking=working;
@@ -1620,9 +1726,9 @@ struct BackendChoice {
 }
 
 fn settings_path() -> std::path::PathBuf {
-    std::env::var("APPDATA")
-        .map(|roam| std::path::PathBuf::from(roam).join("dsh-desktop").join("settings.json"))
-        .unwrap_or_else(|_| std::env::temp_dir().join("dsh-desktop-settings.json"))
+    platform::settings_dir()
+        .map(|dir| dir.join("settings.json"))
+        .unwrap_or_else(|| std::env::temp_dir().join("dsh-desktop-settings.json"))
 }
 
 static SHELL_SETTINGS: std::sync::OnceLock<Mutex<ShellSettings>> = std::sync::OnceLock::new();
@@ -1633,6 +1739,9 @@ fn shell_settings() -> &'static Mutex<ShellSettings> {
     SHELL_SETTINGS.get_or_init(|| {
         let loaded: ShellSettings = std::fs::read_to_string(settings_path())
             .ok()
+            // Windows tools (PowerShell, Notepad) happily write a UTF-8 BOM;
+            // strip it so a hand-edited file is never silently ignored.
+            .map(|text| text.trim_start_matches('\u{feff}').to_string())
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
         Mutex::new(loaded)
@@ -1693,9 +1802,11 @@ fn serve_control(
                 // no DSH page exists yet, so all of this is shell-owned).
                 "GET /setup" => html_response(&mut stream, &setup_html()),
                 "GET /setup-status" => {
-                    let (phase, log, done, error, cancelled) = PROVISION
+                    let (phase, log, done, error, cancelled, steps) = PROVISION
                         .lock()
-                        .map(|s| (s.phase.clone(), s.log.clone(), s.done, s.error.clone(), s.cancelled))
+                        .map(|s| {
+                            (s.phase.clone(), s.log.clone(), s.done, s.error.clone(), s.cancelled, s.steps.clone())
+                        })
                         .unwrap_or_default();
                     let tail: Vec<String> =
                         log.into_iter().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect();
@@ -1710,6 +1821,7 @@ fn serve_control(
                     let out = serde_json::json!({
                         "phase": phase, "log": tail, "done": done,
                         "error": error, "state": state, "cancelled": cancelled,
+                        "steps": steps,
                     });
                     json_response(&mut stream, 200, &out.to_string());
                 }
@@ -1820,6 +1932,9 @@ fn serve_control(
                             s.done = true;
                             s.error = None;
                             s.cancelled = true;
+                            // A half-finished checklist would keep an
+                            // "active" row spinning with nothing running.
+                            s.steps.clear();
                         }
                         json_response(&mut stream, 200, r#"{"ok":true,"cancelled":true}"#);
                         return;
@@ -2465,6 +2580,16 @@ fn run_setup_window(frame_port: u16) {
 }
 
 fn main() {
+    // Portable mode: keep WebView2's own cache/profile with the rest of
+    // the portable state instead of %LOCALAPPDATA%\<identifier>. Must be
+    // set before the first WebView2 environment exists in this process,
+    // and an explicit user value always wins.
+    if let Some(root) = platform::portable_root() {
+        if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", root.join("webview"));
+        }
+    }
+    eprintln!("[browser] state root: {}", platform::state_root_note());
     let frame_port = shell_frame_port();
     // Dev override always boots straight through; otherwise a setup flag
     // (menu → Backend…) or no usable backend at all enters setup mode.

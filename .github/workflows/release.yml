@@ -32,7 +32,32 @@ jobs:
         run: cargo install tauri-cli --locked
       - name: Build installer
         run: cargo tauri build
+      - name: Package portable zip
+        # Same binary as the installer; the portable.txt marker next to the
+        # exe switches shell-owned state to a data\ folder beside it.
+        shell: pwsh
+        run: |
+          $version = (Get-Content tauri.conf.json | ConvertFrom-Json).version
+          $stage = "portable/dsh-desktop"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target/release/dsh-desktop.exe $stage/
+          Set-Content -Encoding utf8 "$stage/portable.txt" -Value @(
+            "Portable mode marker.",
+            "With this file next to dsh-desktop.exe, the shell keeps its backend, settings,",
+            "logs and browser data in the data\ folder beside the exe instead of %LOCALAPPDATA%.",
+            "Delete this file to go back to the per-user layout.",
+            "",
+            "First run still needs Git, Node.js 22+, pnpm on PATH and network access, plus the",
+            "WebView2 runtime (preinstalled on Windows 11 and current Windows 10)."
+          )
+          Compress-Archive -Path $stage -DestinationPath "target/release/bundle/dsh-desktop_${version}_portable_x64.zip" -Force
       - name: Publish GitHub release
-        run: gh release create "${{ github.ref_name }}" --title "dsh-desktop ${{ github.ref_name }}" --notes-file .github/release-notes.md target/release/bundle/nsis/*-setup.exe
+        shell: pwsh
+        run: |
+          $assets = @(
+            (Get-Item target/release/bundle/nsis/*-setup.exe).FullName
+            (Get-Item target/release/bundle/*-portable_x64.zip).FullName
+          )
+          gh release create "${{ github.ref_name }}" --title "dsh-desktop ${{ github.ref_name }}" --notes-file .github/release-notes.md @assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

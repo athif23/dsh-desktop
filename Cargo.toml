@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.0"
+version = "0.1.3"
 edition = "2021"
 description = "Boring Tauri v2 shell: spawns upstream `dsh web`, shows it in system WebView2. No DSH fork, no browser logic here."
 license = "MIT"
